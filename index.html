@@ -1,0 +1,952 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>MaCo - 射撃解析</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0a0a0a;
+    --panel: #14161a;
+    --border: #262a30;
+    --text: #e8e8e8;
+    --sub: #8a8f98;
+    --accent: #4fd1c5;
+    --good: #4ade80;
+    --warn: #fbbf24;
+    --bad: #f87171;
+    --gyrox: #f87171;
+    --gyroy: #4ade80;
+    --gyroz: #60a5fa;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, "Hiragino Sans", "Segoe UI", sans-serif;
+    padding: 12px;
+  }
+  h1 {
+    font-size: 18px;
+    margin: 0 0 12px 0;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: var(--bad);
+    flex-shrink: 0;
+  }
+  .dot.connected { background: var(--good); }
+
+  .toolbar {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-bottom: 12px;
+  }
+  button {
+    background: var(--panel);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 16px;
+    font-size: 14px;
+    cursor: pointer;
+  }
+  button:active { transform: scale(0.97); }
+  button.primary { background: var(--accent); color: #0a0a0a; border: none; font-weight: 600; }
+  button:disabled { opacity: 0.4; }
+
+  .manual-mark-btn {
+    width: 100%;
+    padding: 16px;
+    font-size: 15px;
+    font-weight: 700;
+    background: #2a1a1a;
+    color: var(--warn);
+    border: 2px solid var(--warn);
+    border-radius: 10px;
+    margin-bottom: 12px;
+  }
+  .manual-mark-btn:active { background: var(--warn); color: #0a0a0a; }
+  .manual-mark-btn:disabled { opacity: 0.3; border-color: var(--border); color: var(--sub); }
+
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px;
+    margin-bottom: 12px;
+  }
+  .panel h2 {
+    font-size: 13px;
+    color: var(--sub);
+    margin: 0 0 8px 0;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+
+  #chartWrap { height: 220px; }
+  #diffChartWrap { height: 150px; }
+
+  .stat-row {
+    display: flex;
+    gap: 10px;
+  }
+  .stat {
+    flex: 1;
+    text-align: center;
+    padding: 8px;
+    background: #1a1d22;
+    border-radius: 8px;
+  }
+  .stat .val { font-size: 22px; font-weight: 700; }
+  .stat .label { font-size: 11px; color: var(--sub); margin-top: 2px; }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+  th, td {
+    padding: 6px 4px;
+    text-align: center;
+    border-bottom: 1px solid var(--border);
+  }
+  th { color: var(--sub); font-weight: 500; font-size: 11px; }
+  tr.score-good { color: var(--good); }
+  tr.score-mid { color: var(--warn); }
+  tr.score-bad { color: var(--bad); }
+  td.action button { padding: 4px 8px; font-size: 11px; }
+  td input.mantis-input {
+    width: 52px;
+    background: #1a1d22;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 4px;
+    text-align: center;
+    font-size: 12px;
+  }
+  td select.cause-select {
+    background: #1a1d22;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 4px;
+    font-size: 11px;
+    max-width: 90px;
+  }
+  td input.cause-freetext {
+    width: 80px;
+    background: #1a1d22;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 4px;
+    font-size: 11px;
+    margin-top: 4px;
+    display: block;
+  }
+
+  /* 軌跡表示（Mantis DHOT風のターゲット図） */
+  #trajectoryPanel { display: none; }
+  #trajectoryPanel.active { display: block; }
+  .traj-wrap {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 1 / 1;
+    max-width: 360px;
+    margin: 0 auto;
+  }
+  .traj-wrap svg { width: 100%; height: 100%; }
+  .traj-legend {
+    display: flex;
+    justify-content: center;
+    gap: 14px;
+    font-size: 11px;
+    color: var(--sub);
+    margin-top: 8px;
+  }
+  .traj-legend span { display: flex; align-items: center; gap: 4px; }
+  .traj-legend .sw { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+  .factor-bars { margin-top: 10px; }
+  .factor-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 12px; }
+  .factor-row .flabel { width: 90px; color: var(--sub); flex-shrink: 0; }
+  .factor-row .fbar-wrap { flex: 1; background: #1a1d22; border-radius: 4px; height: 10px; overflow: hidden; }
+  .factor-row .fbar { height: 100%; background: var(--accent); }
+  .factor-row .fval { width: 46px; text-align: right; flex-shrink: 0; }
+
+  /* 収集進捗パネル */
+  .progress-summary { font-size: 13px; color: var(--sub); margin-bottom: 10px; display: flex; justify-content: space-between; }
+  .progress-summary .count { color: var(--text); font-weight: 700; font-size: 16px; }
+  .progress-bins { display: flex; flex-direction: column; gap: 8px; }
+  .progress-bin { display: flex; align-items: center; gap: 8px; }
+  .progress-bin .bin-label { width: 60px; font-size: 12px; color: var(--sub); flex-shrink: 0; }
+  .progress-bin .bin-bar-wrap { flex: 1; background: #1a1d22; border-radius: 5px; height: 14px; overflow: hidden; position: relative; }
+  .progress-bin .bin-bar { height: 100%; background: var(--accent); transition: width 0.2s; }
+  .progress-bin .bin-bar.complete { background: var(--good); }
+  .progress-bin .bin-count { width: 46px; text-align: right; font-size: 12px; flex-shrink: 0; }
+
+  .settings label {
+    display: block;
+    font-size: 13px;
+    color: var(--sub);
+    margin-top: 8px;
+  }
+  .settings input[type="range"] { width: 100%; }
+  .settings .val-inline { color: var(--text); font-weight: 600; }
+
+  /* HUDモード（スマートグラス想定：黒背景・高コントラスト） */
+  #hudOverlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: #000;
+    z-index: 999;
+    color: #fff;
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+    font-size: 10vw;
+    text-align: center;
+  }
+  #hudOverlay.active { display: flex; }
+  #hudOverlay .hud-score { font-weight: 800; }
+  #hudOverlay .hud-label { font-size: 5vw; margin-top: 2vh; color: var(--warn); }
+  #hudOverlay .hud-close { position: absolute; top: 20px; right: 20px; font-size: 14px; }
+  #hudOverlay .hud-live { font-size: 4vw; color: #444; }
+  #hudOverlay .hud-live .bar { display: inline-block; width: 60vw; height: 6px; background: #222; position: relative; vertical-align: middle; margin: 0 8px; }
+  #hudOverlay .hud-live .bar .marker { position: absolute; top: -4px; width: 4px; height: 14px; background: var(--accent); }
+</style>
+</head>
+<body>
+
+<h1><span class="dot" id="connDot"></span>MaCo 射撃解析</h1>
+<p style="font-size:11px;color:var(--sub);margin:-8px 0 12px 0;">Marksmanship Coach — Personal Training &amp; Coaching System</p>
+
+<div class="toolbar">
+  <button class="primary" id="btnConnect">BLE接続</button>
+  <button id="btnHud" disabled>HUDモード</button>
+  <button id="btnExport">CSVエクスポート</button>
+  <button id="btnShare">共有/保存</button>
+</div>
+
+<button id="btnManualMark" class="manual-mark-btn" disabled>
+  📍 今の撃発を手動記録（Mantis確認後に押す）
+</button>
+
+<div class="panel">
+  <h2>リアルタイム角速度波形</h2>
+  <div id="chartWrap"><canvas id="liveChart"></canvas></div>
+</div>
+
+<div class="panel">
+  <h2>撃発検知デバッグ（加速度差分・常時表示）</h2>
+  <div id="diffChartWrap"><canvas id="diffChart"></canvas></div>
+  <p style="font-size:11px;color:var(--sub);margin:6px 0 0 0;">
+    赤線が検知閾値。ドライファイア時にこのピークが安定して閾値を超えるか確認しながら、下のスライダーで閾値を調整してください。
+  </p>
+</div>
+
+<div class="panel">
+  <h2>データ収集進捗（目標100件・スコア帯均等）</h2>
+  <div class="progress-summary">
+    <span>Mantisスコア入力済み: <span class="count" id="progressTotal">0</span> / 100</span>
+  </div>
+  <div class="progress-bins" id="progressBins"></div>
+</div>
+
+<div class="panel">
+  <h2>直近ショット</h2>
+  <div class="stat-row">
+    <div class="stat"><div class="val" id="lastScore">--</div><div class="label">自作D値</div></div>
+    <div class="stat"><div class="val" id="lastPeak">--</div><div class="label">最大ブレ(dps)</div></div>
+    <div class="stat"><div class="val" id="lastLabel">--</div><div class="label">Mantis評価</div></div>
+  </div>
+</div>
+
+<div class="panel" id="trajectoryPanel">
+  <h2>軌跡（照準〜撃発〜フォロースルー）<span id="trajShotNo" style="color:var(--sub);font-weight:400;"></span></h2>
+  <div class="traj-wrap"><svg id="trajSvg" viewBox="0 0 320 320"></svg></div>
+  <div class="traj-legend">
+    <span><span class="sw" style="background:#60a5fa"></span>照準中（撃発4秒前〜）</span>
+    <span><span class="sw" style="background:#fbbf24"></span>撃発直前</span>
+    <span><span class="sw" style="background:#f87171"></span>撃発後</span>
+  </div>
+  <div class="factor-bars" id="factorBars"></div>
+</div>
+
+<div class="panel settings">
+  <h2>キャリブレーション設定</h2>
+  <label>撃発検知の閾値（加速度差分 G/サンプル）: <span class="val-inline" id="shotThreshVal">0.15</span>
+    <input type="range" id="shotThresh" min="0.02" max="1.0" step="0.01" value="0.15">
+  </label>
+  <p style="font-size:11px;color:var(--sub);margin:4px 0 0 0;">
+    ドライファイア（ハンマー式）想定：反動ではなくストライカー落下時の微振動（サンプル間の加速度変化の急峻さ）で検知します。
+  </p>
+  <label>Dmin（100点基準・ブレ量）: <span class="val-inline" id="dminVal">2.0</span>
+    <input type="range" id="dmin" min="0" max="20" step="0.5" value="2.0">
+  </label>
+  <label>Dmax（50点基準・ブレ量）: <span class="val-inline" id="dmaxVal">40</span>
+    <input type="range" id="dmax" min="10" max="150" step="1" value="40">
+  </label>
+  <label>方向判定の閾値（dps積算）: <span class="val-inline" id="dirThreshVal">8</span>
+    <input type="range" id="dirThresh" min="1" max="50" step="1" value="8">
+  </label>
+  <label>手動記録：反応時間の探索範囲（秒 遡る）: <span class="val-inline" id="manualLookbackVal">1.5</span>
+    <input type="range" id="manualLookback" min="0.3" max="3.0" step="0.1" value="1.5">
+  </label>
+  <p style="font-size:11px;color:var(--sub);margin:4px 0 0 0;">
+    手動ボタン押下時刻からこの秒数分さかのぼった範囲内で、加速度差分の最大ピークを探してT0とします。ピークが見つからない場合のみ、下の固定補正値を使います。
+  </p>
+  <label>手動記録：ピーク未検出時の固定補正（秒）: <span class="val-inline" id="manualFallbackVal">0.4</span>
+    <input type="range" id="manualFallback" min="0.1" max="1.5" step="0.05" value="0.4">
+  </label>
+</div>
+
+<div class="panel">
+  <h2>ショット履歴</h2>
+  <table>
+    <thead>
+      <tr><th>No.</th><th>時刻</th><th>検知</th><th>Mantis<br>スコア</th><th>低下原因<br>(個癖)</th><th>最大ブレ</th><th>軌跡</th></tr>
+    </thead>
+    <tbody id="shotTable"></tbody>
+  </table>
+</div>
+
+<!-- HUDオーバーレイ（スマートグラス表示用モード） -->
+<div id="hudOverlay">
+  <div class="hud-close" onclick="toggleHud(false)">✕ 閉じる</div>
+  <div class="hud-live" id="hudLive"><span class="bar"><span class="marker" id="hudMarker" style="left:50%"></span></span></div>
+  <div class="hud-score" id="hudScore">--</div>
+  <div class="hud-label" id="hudLabel"></div>
+</div>
+
+<script>
+// =========================================================
+// MaCo (Marksmanship Coach) Webアプリ
+// M5StickS3からBLEでIMU生データ(100Hz)を受信し、
+// ブラウザ側で撃発検知・スコア計算・診断・ログ保存を行う。
+// =========================================================
+
+// ---- BLE UUID（ファームウェア側と一致させること） ----
+const SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+const CHAR_UUID    = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
+
+// ---- パケット構造：uint32 timestamp_ms + float x6 (28 byte, little-endian) ----
+const PACKET_SIZE = 28;
+
+// ---- 状態 ----
+let device = null, gattChar = null;
+let liveBuffer = []; // 常時ローリングバッファ {t, gx, gy, gz, ax, ay, az}
+
+// 軌跡切り出し範囲：撃発4秒前 〜 0.5秒後
+const PRE_SHOT_MS = 4000;
+const POST_SHOT_MS = 500;
+const MANUAL_LOOKBACK_MAX_MS = 3000; // 手動マーク時にピークを探す最大遡り範囲（スライダー上限と合わせる）
+const LIVE_BUFFER_MAX_MS = PRE_SHOT_MS + POST_SHOT_MS + MANUAL_LOOKBACK_MAX_MS + 500; // 手動マークのピーク探索＋軌跡切り出し分を確保
+
+let shots = []; // ショット履歴（Mantisスコア・低下原因は後で手入力）
+let lastShotTimestamp = -Infinity;
+const REFRACTORY_MS = 800; // 誤検知の連続カウントを防ぐ不応期（軌跡が長くなった分、間隔も広めに）
+
+// Mantis Xの代表的な診断ラベル（低下原因のプルダウン選択肢）
+const CAUSE_OPTIONS = [
+  'ガク引き',
+  '押し込み',
+  '突き上げ',
+  '指のかけすぎ（横方向）',
+  '指のかかりが浅い',
+  '呼吸のタイミング',
+  'グリップの緩み',
+  'その他（自由入力）',
+];
+
+// ---- キャリブレーションパラメータ（UIのスライダーと連動） ----
+// 注：自作スコア計算式は未実装。ここではD値（ブレ量）とMantisスコアの
+// 対応データを集めるための「暫定判定」用の閾値のみ保持する。
+let params = {
+  shotThresh: 0.15, // 加速度差分（G/サンプル）の検知閾値。反動方式は廃止。
+  dmin: 2.0,
+  dmax: 40,
+  dirThresh: 8,
+  manualLookback: 1.5, // 秒。手動マーク時にこの範囲を遡ってピークを探す
+  manualFallback: 0.4, // 秒。ピークが見つからない場合の固定補正値
+};
+
+let prevAccelMag = null; // 差分計算用に直前サンプルの合成加速度を保持
+
+// ---- Chart.js セットアップ ----
+const ctx = document.getElementById('liveChart').getContext('2d');
+const MAX_POINTS = 300; // 3秒分@100Hz相当の表示ウィンドウ
+const chart = new Chart(ctx, {
+  type: 'line',
+  data: {
+    labels: [],
+    datasets: [
+      { label: 'GyroX', data: [], borderColor: '#f87171', pointRadius: 0, borderWidth: 1.5 },
+      { label: 'GyroY', data: [], borderColor: '#4ade80', pointRadius: 0, borderWidth: 1.5 },
+      { label: 'GyroZ', data: [], borderColor: '#60a5fa', pointRadius: 0, borderWidth: 1.5 },
+    ]
+  },
+  options: {
+    animation: false,
+    responsive: true,
+    maintainAspectRatio: false,
+    scales: {
+      x: { display: false },
+      y: { title: { display: true, text: 'deg/s', color: '#8a8f98' }, grid: { color: '#262a30' }, ticks: { color: '#8a8f98' } }
+    },
+    plugins: { legend: { labels: { color: '#e8e8e8' } } }
+  }
+});
+
+// ---- 撃発検知デバッグ用チャート（加速度差分の常時表示） ----
+const diffCtx = document.getElementById('diffChart').getContext('2d');
+const diffChart = new Chart(diffCtx, {
+  type: 'line',
+  data: {
+    labels: [],
+    datasets: [
+      { label: '加速度差分(G)', data: [], borderColor: '#4fd1c5', pointRadius: 0, borderWidth: 1.5 },
+      {
+        label: '検知閾値', data: [], borderColor: '#f87171', borderDash: [4, 4],
+        pointRadius: 0, borderWidth: 1,
+      },
+    ]
+  },
+  options: {
+    animation: false,
+    responsive: true,
+    maintainAspectRatio: false,
+    scales: {
+      x: { display: false },
+      y: { title: { display: true, text: 'G/サンプル', color: '#8a8f98' }, grid: { color: '#262a30' }, ticks: { color: '#8a8f98' } }
+    },
+    plugins: { legend: { labels: { color: '#e8e8e8' } } }
+  }
+});
+
+// =========================================================
+// BLE接続
+// =========================================================
+document.getElementById('btnConnect').addEventListener('click', connectBle);
+
+async function connectBle() {
+  try {
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [SERVICE_UUID] }]
+    });
+    const server = await device.gatt.connect();
+    const service = await server.getPrimaryService(SERVICE_UUID);
+    gattChar = await service.getCharacteristic(CHAR_UUID);
+    await gattChar.startNotifications();
+    gattChar.addEventListener('characteristicvaluechanged', onImuData);
+
+    device.addEventListener('gattserverdisconnected', onDisconnected);
+
+    setConnected(true);
+  } catch (err) {
+    console.error('BLE接続エラー:', err);
+    alert('BLE接続に失敗しました: ' + err.message);
+  }
+}
+
+function onDisconnected() {
+  setConnected(false);
+}
+
+function setConnected(connected) {
+  document.getElementById('connDot').classList.toggle('connected', connected);
+  document.getElementById('btnConnect').textContent = connected ? '接続中' : 'BLE接続';
+  document.getElementById('btnHud').disabled = !connected;
+  document.getElementById('btnManualMark').disabled = !connected;
+}
+
+// =========================================================
+// IMUデータ受信・パース
+// =========================================================
+function onImuData(event) {
+  const dv = event.target.value; // DataView
+  if (dv.byteLength < PACKET_SIZE) return;
+
+  const t = dv.getUint32(0, true);
+  const gx = dv.getFloat32(4, true);
+  const gy = dv.getFloat32(8, true);
+  const gz = dv.getFloat32(12, true);
+  const ax = dv.getFloat32(16, true);
+  const ay = dv.getFloat32(20, true);
+  const az = dv.getFloat32(24, true);
+
+  const sample = { t, gx, gy, gz, ax, ay, az, diff: 0 };
+  liveBuffer.push(sample);
+
+  // 古いサンプルを破棄（バッファ上限より前）
+  const cutoff = t - LIVE_BUFFER_MAX_MS;
+  while (liveBuffer.length && liveBuffer[0].t < cutoff) liveBuffer.shift();
+
+  updateChart(sample);
+  checkShotDetection(sample);
+}
+
+function updateChart(sample) {
+  chart.data.labels.push('');
+  chart.data.datasets[0].data.push(sample.gx);
+  chart.data.datasets[1].data.push(sample.gy);
+  chart.data.datasets[2].data.push(sample.gz);
+
+  if (chart.data.labels.length > MAX_POINTS) {
+    chart.data.labels.shift();
+    chart.data.datasets.forEach(d => d.data.shift());
+  }
+  chart.update('none');
+
+  // HUD表示中ならライブ振れ幅バーも更新
+  if (document.getElementById('hudOverlay').classList.contains('active')) {
+    const mag = Math.sqrt(sample.gx ** 2 + sample.gy ** 2) ;
+    const pos = Math.max(0, Math.min(100, 50 + mag * 1.5)); // ざっくり中心からの振れを%表示
+    document.getElementById('hudMarker').style.left = pos + '%';
+  }
+}
+
+// 撃発検知デバッグ用チャートの更新（加速度差分と現在の閾値を常時表示）
+function updateDiffChart(diffValue) {
+  diffChart.data.labels.push('');
+  diffChart.data.datasets[0].data.push(diffValue);
+  diffChart.data.datasets[1].data.push(params.shotThresh);
+
+  if (diffChart.data.labels.length > MAX_POINTS) {
+    diffChart.data.labels.shift();
+    diffChart.data.datasets.forEach(d => d.data.shift());
+  }
+  diffChart.update('none');
+}
+
+// =========================================================
+// 撃発検知（ドライファイア/ハンマー式想定）
+// 反動ではなく、ストライカー落下時の微振動＝サンプル間の
+// 合成加速度の急な変化（差分）を検知対象とする。
+// =========================================================
+function checkShotDetection(sample) {
+  const accelMag = Math.sqrt(sample.ax ** 2 + sample.ay ** 2 + sample.az ** 2);
+
+  if (prevAccelMag === null) {
+    prevAccelMag = accelMag;
+    updateDiffChart(0);
+    return;
+  }
+
+  const diff = Math.abs(accelMag - prevAccelMag);
+  prevAccelMag = accelMag;
+  sample.diff = diff; // 手動マーク時のピーク探索用に保存しておく
+  updateDiffChart(diff);
+
+  if (diff < params.shotThresh) return;
+  if (sample.t - lastShotTimestamp < REFRACTORY_MS) return; // 不応期中は無視
+
+  lastShotTimestamp = sample.t;
+  const t0 = sample.t;
+
+  // 撃発後0.5秒分のデータが溜まるまで待ってから切り出す
+  setTimeout(() => processShot(t0, 'auto'), POST_SHOT_MS + 50);
+}
+
+// =========================================================
+// 手動マーク（自動検知が外れた場合の救済）
+// Mantis側の表示を見てから押すため、押下時刻は実際の撃発より遅れる。
+// 押下時刻から一定範囲を遡り、加速度差分の最大ピークをT0として採用する。
+// ピークが見つからない場合のみ、固定の反応時間補正値を使う。
+// =========================================================
+function manualMarkShot() {
+  const pressTime = liveBuffer.length ? liveBuffer[liveBuffer.length - 1].t : null;
+  if (pressTime === null) {
+    alert('データを受信していません。BLE接続を確認してください。');
+    return;
+  }
+
+  const lookbackMs = params.manualLookback * 1000;
+  const searchStart = pressTime - lookbackMs;
+  const searchSamples = liveBuffer.filter(s => s.t >= searchStart && s.t <= pressTime);
+
+  let t0;
+  let method;
+  if (searchSamples.length > 0) {
+    const peakSample = searchSamples.reduce((a, b) => (b.diff > a.diff ? b : a), searchSamples[0]);
+    if (peakSample.diff > 0) {
+      t0 = peakSample.t;
+      method = 'manual-peak';
+    }
+  }
+  if (t0 === undefined) {
+    // ピークが見つからない場合：固定の反応時間補正値を使う
+    t0 = pressTime - params.manualFallback * 1000;
+    method = 'manual-fallback';
+  }
+
+  lastShotTimestamp = t0;
+  // 押下時点で既にT0以降のデータはバッファに入っているため、即座に切り出す
+  processShot(t0, method);
+}
+
+document.getElementById('btnManualMark').addEventListener('click', manualMarkShot);
+
+// T0の4秒前〜0.5秒後を抽出し、軌跡・暫定D値を計算して履歴に追加する
+// （自作スコア式は未実装。ここではMantisスコアとの突き合わせ用データを残すのみ）
+function processShot(t0, method = 'auto') {
+  const windowStart = t0 - PRE_SHOT_MS;
+  const windowEnd = t0 + POST_SHOT_MS;
+  const windowSamples = liveBuffer.filter(s => s.t >= windowStart && s.t <= windowEnd);
+  if (windowSamples.length < 2) return;
+
+  // 軌跡座標：Gyro X/Yを単純積分して相対角度変化を算出（中心=撃発4秒前の向き）
+  const trajectory = buildTrajectory(windowSamples, t0);
+
+  // 直前100msのブレ量D（暫定指標。自作スコア式ができるまでの参考値）
+  const preShotSamples = windowSamples.filter(s => s.t >= t0 - 100 && s.t <= t0);
+  let D = 0, peak = 0;
+  for (let i = 1; i < preShotSamples.length; i++) {
+    const dt = (preShotSamples[i].t - preShotSamples[i - 1].t) / 1000;
+    const gx = preShotSamples[i].gx, gy = preShotSamples[i].gy;
+    D += (Math.abs(gx) + Math.abs(gy)) * dt;
+    peak = Math.max(peak, Math.abs(gx), Math.abs(gy));
+  }
+
+  // スコア低下要因の区間分解（表示用の参考値。正式なスコア式ではない）
+  const factors = buildFactorBreakdown(windowSamples, t0);
+
+  const methodLabel = { auto: '自動検知', 'manual-peak': '手動(ピーク特定)', 'manual-fallback': '手動(推定T0)' }[method];
+
+  const shot = {
+    no: shots.length + 1,
+    time: new Date().toLocaleTimeString('ja-JP'),
+    method,       // 'auto' | 'manual-peak' | 'manual-fallback'
+    methodLabel,
+    mantisScore: null, // 手入力待ち
+    cause: '',         // 手入力待ち（プルダウン選択値）
+    causeFreeText: '', // 「その他」選択時の自由記述
+    peak: peak.toFixed(1),
+    D: D.toFixed(2),
+    waveform: windowSamples,
+    trajectory,
+    factors,
+  };
+  shots.unshift(shot);
+  renderShotTable();
+  updateLastShotStats(shot);
+  updateHud(shot);
+  showTrajectory(0); // 最新ショットを自動表示
+}
+
+// Gyro X/Yを単純積分して相対角度（deg相当）に変換し、SVG座標系にマッピングする
+function buildTrajectory(samples, t0) {
+  let angleX = 0, angleY = 0; // 積算角度（相対値、撃発4秒前を0とする）
+  const points = [];
+  for (let i = 1; i < samples.length; i++) {
+    const dt = (samples[i].t - samples[i - 1].t) / 1000;
+    angleX += samples[i].gx * dt;
+    angleY += samples[i].gy * dt;
+    points.push({
+      t: samples[i].t - t0, // 撃発を基準(0)とした相対時刻
+      x: angleX,
+      y: angleY,
+    });
+  }
+  return points;
+}
+
+// 撃発前後を複数区間に分け、各区間のブレ量を比較して「どこでスコアが落ちたか」の参考値を出す
+// 注：正式な重み付け・スコア式は未確定。Mantisスコアとの相関を見るための暫定内訳。
+function buildFactorBreakdown(samples, t0) {
+  const segments = [
+    { label: '照準期(4秒前〜1秒前)', from: -4000, to: -1000 },
+    { label: '引き金操作(1秒前〜)', from: -1000, to: -0 },
+    { label: '撃発直前(100ms)', from: -100, to: 0 },
+    { label: '撃発後(フォロー)', from: 0, to: POST_SHOT_MS },
+  ];
+  return segments.map(seg => {
+    const segSamples = samples.filter(s => (s.t - t0) >= seg.from && (s.t - t0) <= seg.to);
+    let sum = 0;
+    for (let i = 1; i < segSamples.length; i++) {
+      const dt = (segSamples[i].t - segSamples[i - 1].t) / 1000;
+      sum += (Math.abs(segSamples[i].gx) + Math.abs(segSamples[i].gy)) * dt;
+    }
+    return { label: seg.label, value: sum };
+  });
+}
+
+// =========================================================
+// UI更新
+// =========================================================
+function updateLastShotStats(shot) {
+  document.getElementById('lastScore').textContent = shot.D;
+  document.getElementById('lastPeak').textContent = shot.peak;
+  const causeText = shot.cause === 'その他（自由入力）' ? (shot.causeFreeText || '未入力') : (shot.cause || '未入力');
+  document.getElementById('lastLabel').textContent = shot.mantisScore != null ? `${shot.mantisScore} / ${causeText}` : '未入力';
+}
+
+// MantisスコアはD値と直接連動しないため暫定の色分けは行わず、入力有無だけで表示を変える
+function scoreClass(shot) {
+  if (shot.mantisScore == null) return '';
+  if (shot.mantisScore >= 85) return 'score-good';
+  if (shot.mantisScore >= 60) return 'score-mid';
+  return 'score-bad';
+}
+
+function renderShotTable() {
+  const tbody = document.getElementById('shotTable');
+  tbody.innerHTML = shots.map((s, idx) => `
+    <tr class="${scoreClass(s)}">
+      <td>${s.no}</td>
+      <td>${s.time}</td>
+      <td style="font-size:10px;color:${s.method === 'auto' ? 'var(--good)' : 'var(--warn)'};">${s.methodLabel}</td>
+      <td><input type="number" class="mantis-input" min="0" max="100" step="0.1"
+            value="${s.mantisScore ?? ''}" placeholder="--"
+            onchange="setMantisScore(${idx}, this.value)"></td>
+      <td>
+        <select class="cause-select" onchange="setCause(${idx}, this.value)">
+          <option value="" ${s.cause === '' ? 'selected' : ''}>--</option>
+          ${CAUSE_OPTIONS.map(c => `<option value="${c}" ${s.cause === c ? 'selected' : ''}>${c}</option>`).join('')}
+        </select>
+        ${s.cause === 'その他（自由入力）' ? `
+          <input type="text" class="cause-freetext" placeholder="内容を入力"
+                 value="${s.causeFreeText}" onchange="setCauseFreeText(${idx}, this.value)">
+        ` : ''}
+      </td>
+      <td>${s.peak}</td>
+      <td class="action"><button onclick="showTrajectory(${idx})">表示</button></td>
+    </tr>
+  `).join('');
+}
+
+// Mantis DHOTスコアの手入力を反映
+function setMantisScore(idx, value) {
+  const v = parseFloat(value);
+  shots[idx].mantisScore = isNaN(v) ? null : v;
+  renderShotTable();
+  if (idx === 0) updateLastShotStats(shots[0]);
+  renderProgressPanel();
+}
+
+// =========================================================
+// データ収集進捗（目標100件、90/80/70/60/50点台に各20件）
+// =========================================================
+const PROGRESS_BINS = [
+  { label: '90点台', min: 90, max: 100, target: 20 },
+  { label: '80点台', min: 80, max: 90, target: 20 },
+  { label: '70点台', min: 70, max: 80, target: 20 },
+  { label: '60点台', min: 60, max: 70, target: 20 },
+  { label: '50点台', min: 50, max: 60, target: 20 },
+];
+
+function renderProgressPanel() {
+  const scored = shots.filter(s => s.mantisScore != null);
+  document.getElementById('progressTotal').textContent = scored.length;
+
+  const binsHtml = PROGRESS_BINS.map(bin => {
+    // maxは90点台なら[90,100)、ただし100点ちょうども90点台に含める
+    const count = scored.filter(s => {
+      if (bin.max === 100) return s.mantisScore >= bin.min && s.mantisScore <= bin.max;
+      return s.mantisScore >= bin.min && s.mantisScore < bin.max;
+    }).length;
+    const pct = Math.min(100, (count / bin.target) * 100);
+    const complete = count >= bin.target;
+    return `
+      <div class="progress-bin">
+        <div class="bin-label">${bin.label}</div>
+        <div class="bin-bar-wrap"><div class="bin-bar ${complete ? 'complete' : ''}" style="width:${pct}%"></div></div>
+        <div class="bin-count">${count} / ${bin.target}</div>
+      </div>
+    `;
+  }).join('');
+  document.getElementById('progressBins').innerHTML = binsHtml;
+}
+
+// 低下原因（個癖）のプルダウン選択を反映。「その他」選択時は自由入力欄を表示するため再描画する
+function setCause(idx, value) {
+  shots[idx].cause = value;
+  if (value !== 'その他（自由入力）') shots[idx].causeFreeText = '';
+  renderShotTable();
+}
+
+// 「その他」選択時の自由記述を反映
+function setCauseFreeText(idx, value) {
+  shots[idx].causeFreeText = value;
+}
+
+function showWaveform(idx) {
+  const shot = shots[idx];
+  const wf = shot.waveform;
+  chart.data.labels = wf.map((_, i) => i);
+  chart.data.datasets[0].data = wf.map(s => s.gx);
+  chart.data.datasets[1].data = wf.map(s => s.gy);
+  chart.data.datasets[2].data = wf.map(s => s.gz);
+  chart.update();
+}
+
+// =========================================================
+// 軌跡表示（Mantis DHOT風：青→黄→X→赤のターゲット図）
+// =========================================================
+function showTrajectory(idx) {
+  const shot = shots[idx];
+  if (!shot) return;
+  document.getElementById('trajectoryPanel').classList.add('active');
+  document.getElementById('trajShotNo').textContent = ` - No.${shot.no}`;
+  drawTrajectorySvg(shot.trajectory);
+  renderFactorBars(shot.factors);
+}
+
+function drawTrajectorySvg(points) {
+  const svg = document.getElementById('trajSvg');
+  const SIZE = 320, CENTER = 160;
+
+  // 軌跡の最大振幅からスケールを決定（中心から余白20pxまでに収める）
+  const maxAmp = Math.max(1, ...points.map(p => Math.max(Math.abs(p.x), Math.abs(p.y))));
+  const scale = (CENTER - 30) / maxAmp;
+
+  let svgContent = '';
+
+  // 背景の同心円（Mantisのターゲット表示を模したガイド）
+  for (let r = 30; r <= CENTER - 10; r += 30) {
+    svgContent += `<circle cx="${CENTER}" cy="${CENTER}" r="${r}" stroke="#3a1f22" stroke-width="1" fill="none"/>`;
+  }
+  svgContent += `<line x1="10" y1="${CENTER}" x2="${SIZE - 10}" y2="${CENTER}" stroke="#444" stroke-width="1"/>`;
+  svgContent += `<line x1="${CENTER}" y1="10" x2="${CENTER}" y2="${SIZE - 10}" stroke="#444" stroke-width="1"/>`;
+
+  // 時間経過で色分け：撃発前(青→黄)、撃発後(赤)
+  // t=-4000ms(青)〜t=0ms(黄)、t=0〜+500ms(赤)
+  function colorFor(t) {
+    if (t >= 0) return '#f87171'; // 撃発後：赤
+    const ratio = Math.min(1, (t + PRE_SHOT_MS) / PRE_SHOT_MS); // 0(古い/青)→1(撃発直前/黄)
+    // 青(#60a5fa) → 黄(#fbbf24) の線形補間
+    const c1 = [0x60, 0xa5, 0xfa], c2 = [0xfb, 0xbf, 0x24];
+    const c = c1.map((v, i) => Math.round(v + (c2[i] - v) * ratio));
+    return `rgb(${c[0]},${c[1]},${c[2]})`;
+  }
+
+  // 軌跡をセグメントごとに色を変えて描画
+  let pathSegments = '';
+  for (let i = 1; i < points.length; i++) {
+    const p0 = points[i - 1], p1 = points[i];
+    const x0 = CENTER + p0.x * scale, y0 = CENTER - p0.y * scale;
+    const x1 = CENTER + p1.x * scale, y1 = CENTER - p1.y * scale;
+    pathSegments += `<line x1="${x0.toFixed(1)}" y1="${y0.toFixed(1)}" x2="${x1.toFixed(1)}" y2="${y1.toFixed(1)}" stroke="${colorFor(p1.t)}" stroke-width="2.5" stroke-linecap="round"/>`;
+  }
+  svgContent += pathSegments;
+
+  // 撃発の瞬間(t≈0)にX印を重ねる
+  const shotPoint = points.reduce((a, b) => Math.abs(b.t) < Math.abs(a.t) ? b : a, points[0]);
+  if (shotPoint) {
+    const sx = CENTER + shotPoint.x * scale, sy = CENTER - shotPoint.y * scale;
+    svgContent += `<text x="${sx}" y="${sy}" font-size="16" fill="#fff" text-anchor="middle" dominant-baseline="central" font-weight="bold">×</text>`;
+  }
+
+  svg.innerHTML = svgContent;
+}
+
+// スコア低下要因の内訳バー（暫定：ブレ量の区間比較。正式スコア式ではない）
+function renderFactorBars(factors) {
+  const maxVal = Math.max(0.01, ...factors.map(f => f.value));
+  document.getElementById('factorBars').innerHTML = factors.map(f => `
+    <div class="factor-row">
+      <div class="flabel">${f.label}</div>
+      <div class="fbar-wrap"><div class="fbar" style="width:${(f.value / maxVal * 100).toFixed(0)}%"></div></div>
+      <div class="fval">${f.value.toFixed(1)}</div>
+    </div>
+  `).join('');
+}
+
+// =========================================================
+// キャリブレーション設定（スライダー連動）
+// =========================================================
+function bindSlider(id, valId, key, isInt) {
+  const el = document.getElementById(id);
+  const valEl = document.getElementById(valId);
+  el.addEventListener('input', () => {
+    params[key] = isInt ? parseInt(el.value) : parseFloat(el.value);
+    valEl.textContent = el.value;
+  });
+}
+bindSlider('shotThresh', 'shotThreshVal', 'shotThresh', false);
+bindSlider('dmin', 'dminVal', 'dmin', false);
+bindSlider('dmax', 'dmaxVal', 'dmax', true);
+bindSlider('dirThresh', 'dirThreshVal', 'dirThresh', true);
+bindSlider('manualLookback', 'manualLookbackVal', 'manualLookback', false);
+bindSlider('manualFallback', 'manualFallbackVal', 'manualFallback', false);
+
+// =========================================================
+// HUDモード（スマートグラス表示想定：黒背景・高コントラスト）
+// =========================================================
+document.getElementById('btnHud').addEventListener('click', () => toggleHud(true));
+function toggleHud(show) {
+  document.getElementById('hudOverlay').classList.toggle('active', show);
+}
+function updateHud(shot) {
+  // 自作スコア未実装のため、HUDにはD値（暫定ブレ量指標）を表示する
+  document.getElementById('hudScore').textContent = shot.D;
+  document.getElementById('hudScore').style.color = '#e8e8e8';
+  document.getElementById('hudLabel').textContent = 'Mantisスコア・原因は後で入力';
+}
+
+// =========================================================
+// CSVエクスポート / 共有
+// =========================================================
+function buildCsv() {
+  // Mantisスコアと自作側の生データ(D値・軌跡)を突き合わせられる形式で出力する。
+  // 将来この対応データから自作スコア式の閾値(Dmin/Dmax等)を決定する。
+  const header = 'No,時刻,検知方式,Mantisスコア,低下原因,最大ブレdps,ブレ量D,軌跡X,軌跡Y,軌跡t_ms,波形GyroX,波形GyroY\n';
+  const rows = shots.map(s => {
+    const cause = s.cause === 'その他（自由入力）' ? s.causeFreeText : s.cause;
+    const trajX = s.trajectory.map(p => p.x.toFixed(2)).join(' ');
+    const trajY = s.trajectory.map(p => p.y.toFixed(2)).join(' ');
+    const trajT = s.trajectory.map(p => p.t).join(' ');
+    const gxArr = s.waveform.map(w => w.gx.toFixed(2)).join(' ');
+    const gyArr = s.waveform.map(w => w.gy.toFixed(2)).join(' ');
+    return `${s.no},${s.time},${s.methodLabel},${s.mantisScore ?? ''},${cause || ''},${s.peak},${s.D},"${trajX}","${trajY}","${trajT}","${gxArr}","${gyArr}"`;
+  }).join('\n');
+  return header + rows;
+}
+
+document.getElementById('btnExport').addEventListener('click', () => {
+  const csv = buildCsv();
+  const blob = new Blob([csv], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `maco_shots_${Date.now()}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+});
+
+// iOS（Bluefy等）でのファイル保存制約を回避するためのWeb Share API連携
+document.getElementById('btnShare').addEventListener('click', async () => {
+  const csv = buildCsv();
+  if (navigator.share && navigator.canShare) {
+    try {
+      const file = new File([csv], `maco_shots_${Date.now()}.csv`, { type: 'text/csv' });
+      if (navigator.canShare({ files: [file] })) {
+        await navigator.share({ files: [file], title: 'MaCo ショットログ' });
+        return;
+      }
+    } catch (e) {
+      console.warn('Web Share API失敗、クリップボードにフォールバック', e);
+    }
+  }
+  // フォールバック：クリップボードにコピー
+  try {
+    await navigator.clipboard.writeText(csv);
+    alert('CSVをクリップボードにコピーしました');
+  } catch (e) {
+    alert('共有・コピーに失敗しました: ' + e.message);
+  }
+});
+
+// 初期表示（データが無い状態でも進捗パネルの枠を出す）
+renderProgressPanel();
+</script>
+</body>
+</html>
