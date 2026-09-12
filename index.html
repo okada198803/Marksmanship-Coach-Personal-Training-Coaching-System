@@ -283,6 +283,12 @@
 
 <div class="panel settings">
   <h2>キャリブレーション設定</h2>
+  <button id="btnCalibrate" style="width:100%;margin-bottom:12px;background:#1a2a28;border-color:var(--accent);color:var(--accent);">
+    📐 基準姿勢を記録（銃口を真下に向けて静止させて押す）
+  </button>
+  <p style="font-size:11px;color:var(--sub);margin:-6px 0 12px 0;" id="calibStatus">
+    未実施：取り付け後、銃を真下に向けて静止させた状態で一度押してください（取り付けの回転ズレを補正します）。
+  </p>
   <label>撃発検知の閾値（加速度差分 G/サンプル）: <span class="val-inline" id="shotThreshVal">0.15</span>
     <input type="range" id="shotThresh" min="0.02" max="1.0" step="0.01" value="0.15">
   </label>
@@ -380,6 +386,12 @@ let params = {
 };
 
 let prevAccelMag = null; // 差分計算用に直前サンプルの合成加速度を保持
+
+// ---- 基準姿勢（キャリブレーション） ----
+// 取り付け直後に静止させて記録した加速度を基準として保持する。
+// Gyro積分（軌跡描画）自体は変化量なので基準の影響は受けないが、
+// 将来Accelから静的な傾き（重力方向）を使った補正・診断を行う際の土台として保存しておく。
+let calibration = null; // { ax, ay, az } または null（未実施）
 
 // ---- Chart.js セットアップ ----
 const ctx = document.getElementById('liveChart').getContext('2d');
@@ -595,6 +607,41 @@ function manualMarkShot() {
 
 document.getElementById('btnManualMark').addEventListener('click', manualMarkShot);
 
+// =========================================================
+// 基準姿勢のキャリブレーション（取り付け角度の回転補正）
+// 銃を真下に向けて静止させた状態で押すことで、取り付けの回転ズレ（Z軸まわり）を推定する。
+// 理想的には真下に向けた状態でAccel X/Yはゼロ（重力はZ軸のみにかかる）になるはずだが、
+// センサーが斜めに付いていると、その分だけX/Yに重力成分が漏れ出る。このズレ角を
+// 「取り付けの回転角」とみなし、以降の軌跡描画（Gyro X/Y積分）に補正として適用する。
+// =========================================================
+const CALIB_SAMPLE_COUNT = 20; // 直近何サンプルを平均するか（ノイズ低減のため）
+
+function calibrateOrientation() {
+  if (liveBuffer.length < CALIB_SAMPLE_COUNT) {
+    alert('データが不足しています。BLE接続後、少し待ってから押してください。');
+    return;
+  }
+  const recent = liveBuffer.slice(-CALIB_SAMPLE_COUNT);
+  const avg = recent.reduce((acc, s) => {
+    acc.ax += s.ax; acc.ay += s.ay; acc.az += s.az;
+    return acc;
+  }, { ax: 0, ay: 0, az: 0 });
+  const ax = avg.ax / recent.length;
+  const ay = avg.ay / recent.length;
+  const az = avg.az / recent.length;
+
+  // 真下に向けた状態でX/Yに漏れ出た重力成分から、取り付けの回転角（ラジアン）を算出
+  const rotationAngle = Math.atan2(ay, ax);
+
+  calibration = { ax, ay, az, rotationAngle };
+  const statusEl = document.getElementById('calibStatus');
+  const degrees = (rotationAngle * 180 / Math.PI).toFixed(1);
+  statusEl.textContent = `記録済み：取り付け回転角 ${degrees}° （基準Accel: ${ax.toFixed(2)}, ${ay.toFixed(2)}, ${az.toFixed(2)} G）`;
+  statusEl.style.color = 'var(--good)';
+}
+
+document.getElementById('btnCalibrate').addEventListener('click', calibrateOrientation);
+
 // T0の4秒前〜0.5秒後を抽出し、軌跡・暫定D値を計算して履歴に追加する
 // （自作スコア式は未実装。ここではMantisスコアとの突き合わせ用データを残すのみ）
 function processShot(t0, method = 'auto') {
@@ -611,7 +658,7 @@ function processShot(t0, method = 'auto') {
   let D = 0, peak = 0;
   for (let i = 1; i < preShotSamples.length; i++) {
     const dt = (preShotSamples[i].t - preShotSamples[i - 1].t) / 1000;
-    const gx = preShotSamples[i].gx, gy = preShotSamples[i].gy;
+    const { gx, gy } = applyRotationCorrection(preShotSamples[i].gx, preShotSamples[i].gy);
     D += (Math.abs(gx) + Math.abs(gy)) * dt;
     peak = Math.max(peak, Math.abs(gx), Math.abs(gy));
   }
@@ -642,14 +689,27 @@ function processShot(t0, method = 'auto') {
   showTrajectory(0); // 最新ショットを自動表示
 }
 
-// Gyro X/Yを単純積分して相対角度（deg相当）に変換し、SVG座標系にマッピングする
+// 取り付けの回転ズレを打ち消す向きにGyro X/Yを回転補正する（キャリブレーション未実施なら無補正）
+function applyRotationCorrection(gx, gy) {
+  if (!calibration) return { gx, gy };
+  const rot = calibration.rotationAngle;
+  const cosR = Math.cos(-rot), sinR = Math.sin(-rot);
+  return {
+    gx: gx * cosR - gy * sinR,
+    gy: gx * sinR + gy * cosR,
+  };
+}
+
+// Gyro X/Yを単純積分して相対角度（deg相当）に変換し、SVG座標系にマッピングする。
+// キャリブレーション済みの場合、取り付けの回転角分だけGyro X/Yを回転補正してから積分する。
 function buildTrajectory(samples, t0) {
   let angleX = 0, angleY = 0; // 積算角度（相対値、撃発4秒前を0とする）
   const points = [];
   for (let i = 1; i < samples.length; i++) {
     const dt = (samples[i].t - samples[i - 1].t) / 1000;
-    angleX += samples[i].gx * dt;
-    angleY += samples[i].gy * dt;
+    const { gx, gy } = applyRotationCorrection(samples[i].gx, samples[i].gy);
+    angleX += gx * dt;
+    angleY += gy * dt;
     points.push({
       t: samples[i].t - t0, // 撃発を基準(0)とした相対時刻
       x: angleX,
@@ -673,7 +733,8 @@ function buildFactorBreakdown(samples, t0) {
     let sum = 0;
     for (let i = 1; i < segSamples.length; i++) {
       const dt = (segSamples[i].t - segSamples[i - 1].t) / 1000;
-      sum += (Math.abs(segSamples[i].gx) + Math.abs(segSamples[i].gy)) * dt;
+      const { gx, gy } = applyRotationCorrection(segSamples[i].gx, segSamples[i].gy);
+      sum += (Math.abs(gx) + Math.abs(gy)) * dt;
     }
     return { label: seg.label, value: sum };
   });
@@ -898,6 +959,9 @@ function updateHud(shot) {
 function buildCsv() {
   // Mantisスコアと自作側の生データ(D値・軌跡)を突き合わせられる形式で出力する。
   // 将来この対応データから自作スコア式の閾値(Dmin/Dmax等)を決定する。
+  const calibLine = calibration
+    ? `# 基準姿勢(Accel G): ax=${calibration.ax.toFixed(3)}, ay=${calibration.ay.toFixed(3)}, az=${calibration.az.toFixed(3)}, 取り付け回転角=${(calibration.rotationAngle * 180 / Math.PI).toFixed(1)}度\n`
+    : '# 基準姿勢: 未記録\n';
   const header = 'No,時刻,検知方式,Mantisスコア,低下原因,最大ブレdps,ブレ量D,軌跡X,軌跡Y,軌跡t_ms,波形GyroX,波形GyroY\n';
   const rows = shots.map(s => {
     const cause = s.cause === 'その他（自由入力）' ? s.causeFreeText : s.cause;
@@ -908,7 +972,7 @@ function buildCsv() {
     const gyArr = s.waveform.map(w => w.gy.toFixed(2)).join(' ');
     return `${s.no},${s.time},${s.methodLabel},${s.mantisScore ?? ''},${cause || ''},${s.peak},${s.D},"${trajX}","${trajY}","${trajT}","${gxArr}","${gyArr}"`;
   }).join('\n');
-  return header + rows;
+  return calibLine + header + rows;
 }
 
 document.getElementById('btnExport').addEventListener('click', () => {
