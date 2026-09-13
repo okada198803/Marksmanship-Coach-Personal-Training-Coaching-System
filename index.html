@@ -702,21 +702,31 @@ function applyRotationCorrection(gx, gy) {
 
 // Gyro X/Yを単純積分して相対角度（deg相当）に変換し、SVG座標系にマッピングする。
 // キャリブレーション済みの場合、取り付けの回転角分だけGyro X/Yを回転補正してから積分する。
+// 原点（0,0）は撃発の瞬間（T0）とする：積分自体は時系列順（撃発4秒前始点）に行い、
+// 後からT0時点の値を全体から差し引いて原点をシフトする（Mantis DHOT表示に合わせるため）。
 function buildTrajectory(samples, t0) {
-  let angleX = 0, angleY = 0; // 積算角度（相対値、撃発4秒前を0とする）
-  const points = [];
+  let angleX = 0, angleY = 0; // 積算角度（撃発4秒前を仮の原点として積分）
+  const rawPoints = [];
   for (let i = 1; i < samples.length; i++) {
     const dt = (samples[i].t - samples[i - 1].t) / 1000;
     const { gx, gy } = applyRotationCorrection(samples[i].gx, samples[i].gy);
     angleX += gx * dt;
     angleY += gy * dt;
-    points.push({
+    rawPoints.push({
       t: samples[i].t - t0, // 撃発を基準(0)とした相対時刻
       x: angleX,
       y: angleY,
     });
   }
-  return points;
+
+  // T0（相対時刻0）に最も近い点の座標を、新しい原点として全体からシフトする
+  if (rawPoints.length === 0) return rawPoints;
+  const shotPoint = rawPoints.reduce((a, b) => Math.abs(b.t) < Math.abs(a.t) ? b : a, rawPoints[0]);
+  return rawPoints.map(p => ({
+    t: p.t,
+    x: p.x - shotPoint.x,
+    y: p.y - shotPoint.y,
+  }));
 }
 
 // 撃発前後を複数区間に分け、各区間のブレ量を比較して「どこでスコアが落ちたか」の参考値を出す
