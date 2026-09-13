@@ -239,36 +239,6 @@
   📍 今の撃発を手動記録（Mantis確認後に押す）
 </button>
 
-<div class="panel">
-  <h2>リアルタイム角速度波形</h2>
-  <div id="chartWrap"><canvas id="liveChart"></canvas></div>
-</div>
-
-<div class="panel">
-  <h2>撃発検知デバッグ（加速度差分・常時表示）</h2>
-  <div id="diffChartWrap"><canvas id="diffChart"></canvas></div>
-  <p style="font-size:11px;color:var(--sub);margin:6px 0 0 0;">
-    赤線が検知閾値。ドライファイア時にこのピークが安定して閾値を超えるか確認しながら、下のスライダーで閾値を調整してください。
-  </p>
-</div>
-
-<div class="panel">
-  <h2>データ収集進捗（目標100件・スコア帯均等）</h2>
-  <div class="progress-summary">
-    <span>Mantisスコア入力済み: <span class="count" id="progressTotal">0</span> / 100</span>
-  </div>
-  <div class="progress-bins" id="progressBins"></div>
-</div>
-
-<div class="panel">
-  <h2>直近ショット</h2>
-  <div class="stat-row">
-    <div class="stat"><div class="val" id="lastScore">--</div><div class="label">自作D値</div></div>
-    <div class="stat"><div class="val" id="lastPeak">--</div><div class="label">最大ブレ(dps)</div></div>
-    <div class="stat"><div class="val" id="lastLabel">--</div><div class="label">Mantis評価</div></div>
-  </div>
-</div>
-
 <div class="panel" id="trajectoryPanel">
   <h2>軌跡（照準〜撃発〜フォロースルー）<span id="trajShotNo" style="color:var(--sub);font-weight:400;"></span></h2>
   <div class="traj-wrap"><svg id="trajSvg" viewBox="0 0 320 320"></svg></div>
@@ -281,6 +251,15 @@
     リアルタイム表示中：照準の動きをそのまま表示しています。
   </p>
   <div class="factor-bars" id="factorBars"></div>
+</div>
+
+<div class="panel">
+  <h2>直近ショット</h2>
+  <div class="stat-row">
+    <div class="stat"><div class="val" id="lastScore">--</div><div class="label">自作D値</div></div>
+    <div class="stat"><div class="val" id="lastPeak">--</div><div class="label">最大ブレ(dps)</div></div>
+    <div class="stat"><div class="val" id="lastLabel">--</div><div class="label">Mantis評価</div></div>
+  </div>
 </div>
 
 <div class="panel settings">
@@ -315,6 +294,27 @@
   <label>手動記録：ピーク未検出時の固定補正（秒）: <span class="val-inline" id="manualFallbackVal">0.4</span>
     <input type="range" id="manualFallback" min="0.1" max="1.5" step="0.05" value="0.4">
   </label>
+</div>
+
+<div class="panel">
+  <h2>リアルタイム角速度波形</h2>
+  <div id="chartWrap"><canvas id="liveChart"></canvas></div>
+</div>
+
+<div class="panel">
+  <h2>撃発検知デバッグ（加速度差分・常時表示）</h2>
+  <div id="diffChartWrap"><canvas id="diffChart"></canvas></div>
+  <p style="font-size:11px;color:var(--sub);margin:6px 0 0 0;">
+    赤線が検知閾値。ドライファイア時にこのピークが安定して閾値を超えるか確認しながら、下のスライダーで閾値を調整してください。
+  </p>
+</div>
+
+<div class="panel">
+  <h2>データ収集進捗（目標100件・スコア帯均等）</h2>
+  <div class="progress-summary">
+    <span>Mantisスコア入力済み: <span class="count" id="progressTotal">0</span> / 100</span>
+  </div>
+  <div class="progress-bins" id="progressBins"></div>
 </div>
 
 <div class="panel">
@@ -915,9 +915,21 @@ function drawTrajectorySvg(points, isLive = false) {
   const svg = document.getElementById('trajSvg');
   const SIZE = 320, CENTER = 160;
 
-  // 軌跡の最大振幅からスケールを決定（中心から余白20pxまでに収める）
-  const maxAmp = Math.max(1, ...points.map(p => Math.max(Math.abs(p.x), Math.abs(p.y))));
-  const scale = (CENTER - 30) / maxAmp;
+  // 固定スケール：ショット間で見た目の大きさを比較できるよう、全ショット共通の拡大率を使う。
+  // FIXED_SCALE_MAX_AMP（積分後の角度[deg]相当）を枠の半径いっぱいに合わせ、
+  // これを超える振幅は枠の端でクリップして描画する（はみ出た軌跡は切れる）。
+  const FIXED_SCALE_MAX_AMP = 10; // 実測データ(中央値〜75%ile付近)を基準に設定。合わなければ調整可。
+  const RADIUS = CENTER - 30; // 描画可能な半径（余白30px確保）
+  const scale = RADIUS / FIXED_SCALE_MAX_AMP;
+
+  // 中心からの距離がRADIUSを超える点は、その方向のままRADIUS上にクリップする
+  function clipToRadius(px, py) {
+    const dx = px - CENTER, dy = py - CENTER;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    if (dist <= RADIUS) return { x: px, y: py };
+    const ratio = RADIUS / dist;
+    return { x: CENTER + dx * ratio, y: CENTER + dy * ratio };
+  }
 
   let svgContent = '';
 
@@ -945,9 +957,11 @@ function drawTrajectorySvg(points, isLive = false) {
   let pathSegments = '';
   for (let i = 1; i < points.length; i++) {
     const p0 = points[i - 1], p1 = points[i];
-    const x0 = CENTER + p0.x * scale, y0 = CENTER - p0.y * scale;
-    const x1 = CENTER + p1.x * scale, y1 = CENTER - p1.y * scale;
-    pathSegments += `<line x1="${x0.toFixed(1)}" y1="${y0.toFixed(1)}" x2="${x1.toFixed(1)}" y2="${y1.toFixed(1)}" stroke="${colorFor(p1.t)}" stroke-width="2.5" stroke-linecap="round"/>`;
+    const rawX0 = CENTER + p0.x * scale, rawY0 = CENTER - p0.y * scale;
+    const rawX1 = CENTER + p1.x * scale, rawY1 = CENTER - p1.y * scale;
+    const c0 = clipToRadius(rawX0, rawY0);
+    const c1 = clipToRadius(rawX1, rawY1);
+    pathSegments += `<line x1="${c0.x.toFixed(1)}" y1="${c0.y.toFixed(1)}" x2="${c1.x.toFixed(1)}" y2="${c1.y.toFixed(1)}" stroke="${colorFor(p1.t)}" stroke-width="2.5" stroke-linecap="round"/>`;
   }
   svgContent += pathSegments;
 
@@ -955,15 +969,17 @@ function drawTrajectorySvg(points, isLive = false) {
   if (!isLive) {
     const shotPoint = points.reduce((a, b) => Math.abs(b.t) < Math.abs(a.t) ? b : a, points[0]);
     if (shotPoint) {
-      const sx = CENTER + shotPoint.x * scale, sy = CENTER - shotPoint.y * scale;
-      svgContent += `<text x="${sx}" y="${sy}" font-size="16" fill="#fff" text-anchor="middle" dominant-baseline="central" font-weight="bold">×</text>`;
+      const raw = { x: CENTER + shotPoint.x * scale, y: CENTER - shotPoint.y * scale };
+      const c = clipToRadius(raw.x, raw.y);
+      svgContent += `<text x="${c.x}" y="${c.y}" font-size="16" fill="#fff" text-anchor="middle" dominant-baseline="central" font-weight="bold">×</text>`;
     }
   } else {
     // リアルタイム表示中は「現在の銃口位置」を先端の点として小さいマーカーで示す
     const last = points[points.length - 1];
     if (last) {
-      const lx = CENTER + last.x * scale, ly = CENTER - last.y * scale;
-      svgContent += `<circle cx="${lx.toFixed(1)}" cy="${ly.toFixed(1)}" r="4" fill="#fbbf24" stroke="#fff" stroke-width="1"/>`;
+      const raw = { x: CENTER + last.x * scale, y: CENTER - last.y * scale };
+      const c = clipToRadius(raw.x, raw.y);
+      svgContent += `<circle cx="${c.x.toFixed(1)}" cy="${c.y.toFixed(1)}" r="4" fill="#fbbf24" stroke="#fff" stroke-width="1"/>`;
     }
   }
 
