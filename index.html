@@ -154,8 +154,7 @@
   }
 
   /* 軌跡表示（Mantis DHOT風のターゲット図） */
-  #trajectoryPanel { display: none; }
-  #trajectoryPanel.active { display: block; }
+  #trajectoryPanel { }
   .traj-wrap {
     position: relative;
     width: 100%;
@@ -278,6 +277,9 @@
     <span><span class="sw" style="background:#fbbf24"></span>撃発直前</span>
     <span><span class="sw" style="background:#f87171"></span>撃発後</span>
   </div>
+  <p style="font-size:11px;color:var(--sub);margin:6px 0 0 0;" id="trajModeLabel">
+    リアルタイム表示中：照準の動きをそのまま表示しています。
+  </p>
   <div class="factor-bars" id="factorBars"></div>
 </div>
 
@@ -504,6 +506,30 @@ function onImuData(event) {
 
   updateChart(sample);
   checkShotDetection(sample);
+  updateLiveTrajectory(t);
+}
+
+// =========================================================
+// 常時ローリング軌跡表示（Mantisのようにリアルタイムに照準の動きを見せる）
+// ショット確定時（自動/手動）にfreezeされるまでは、直近 PRE_SHOT_MS 分の
+// 動きを常に描画し続ける。100Hz全サンプルで再描画すると重いため間引く。
+// =========================================================
+let lastLiveTrajDrawMs = 0;
+const LIVE_TRAJ_DRAW_INTERVAL_MS = 100; // 10fps相当で十分（人間の目には滑らかに見える）
+let trajFrozen = false; // ショット履歴を見ている間はリアルタイム更新を止める
+
+function updateLiveTrajectory(nowMs) {
+  if (trajFrozen) return;
+  if (nowMs - lastLiveTrajDrawMs < LIVE_TRAJ_DRAW_INTERVAL_MS) return;
+  lastLiveTrajDrawMs = nowMs;
+
+  const windowStart = nowMs - PRE_SHOT_MS;
+  const windowSamples = liveBuffer.filter(s => s.t >= windowStart && s.t <= nowMs);
+  if (windowSamples.length < 2) return;
+
+  // リアルタイム表示では「今」を撃発とみなし、直近の動きを常に中心基準で描く
+  const points = buildTrajectory(windowSamples, nowMs);
+  drawTrajectorySvg(points, true);
 }
 
 function updateChart(sample) {
@@ -862,16 +888,30 @@ function showWaveform(idx) {
 // =========================================================
 // 軌跡表示（Mantis DHOT風：青→黄→X→赤のターゲット図）
 // =========================================================
+// ショット確定時・履歴クリック時に、確定した軌跡をしばらく表示し続ける（フリーズ）。
+// 一定時間後、自動的にリアルタイム表示に復帰する。
+const FREEZE_DISPLAY_MS = 4000; // 確定ショットを表示し続ける時間
+let freezeTimeoutHandle = null;
+
 function showTrajectory(idx) {
   const shot = shots[idx];
   if (!shot) return;
-  document.getElementById('trajectoryPanel').classList.add('active');
-  document.getElementById('trajShotNo').textContent = ` - No.${shot.no}`;
+  document.getElementById('trajShotNo').textContent = ` - No.${shot.no}（確定）`;
+  document.getElementById('trajModeLabel').textContent = `ショット No.${shot.no} を表示中。しばらくするとリアルタイム表示に戻ります。`;
   drawTrajectorySvg(shot.trajectory);
   renderFactorBars(shot.factors);
+
+  trajFrozen = true;
+  if (freezeTimeoutHandle) clearTimeout(freezeTimeoutHandle);
+  freezeTimeoutHandle = setTimeout(() => {
+    trajFrozen = false;
+    document.getElementById('trajShotNo').textContent = '';
+    document.getElementById('trajModeLabel').textContent = 'リアルタイム表示中：照準の動きをそのまま表示しています。';
+    document.getElementById('factorBars').innerHTML = '';
+  }, FREEZE_DISPLAY_MS);
 }
 
-function drawTrajectorySvg(points) {
+function drawTrajectorySvg(points, isLive = false) {
   const svg = document.getElementById('trajSvg');
   const SIZE = 320, CENTER = 160;
 
@@ -888,11 +928,13 @@ function drawTrajectorySvg(points) {
   svgContent += `<line x1="10" y1="${CENTER}" x2="${SIZE - 10}" y2="${CENTER}" stroke="#444" stroke-width="1"/>`;
   svgContent += `<line x1="${CENTER}" y1="10" x2="${CENTER}" y2="${SIZE - 10}" stroke="#444" stroke-width="1"/>`;
 
-  // 時間経過で色分け：撃発前(青→黄)、撃発後(赤)
-  // t=-4000ms(青)〜t=0ms(黄)、t=0〜+500ms(赤)
+  // 時間経過で色分け：
+  // - 確定ショット表示時：撃発前(青→黄)、撃発後(赤)。t=0が実際の撃発の瞬間。
+  // - リアルタイム表示時：撃発はまだ起きていないため全体を青→黄のグラデーションのみとする（赤は使わない）。
   function colorFor(t) {
-    if (t >= 0) return '#f87171'; // 撃発後：赤
-    const ratio = Math.min(1, (t + PRE_SHOT_MS) / PRE_SHOT_MS); // 0(古い/青)→1(撃発直前/黄)
+    if (!isLive && t >= 0) return '#f87171'; // 確定ショットの撃発後のみ：赤
+    const clampedT = Math.min(0, t); // ライブ表示では末端（現在時刻）を「直前」として扱う
+    const ratio = Math.min(1, (clampedT + PRE_SHOT_MS) / PRE_SHOT_MS); // 0(古い/青)→1(直近/黄)
     // 青(#60a5fa) → 黄(#fbbf24) の線形補間
     const c1 = [0x60, 0xa5, 0xfa], c2 = [0xfb, 0xbf, 0x24];
     const c = c1.map((v, i) => Math.round(v + (c2[i] - v) * ratio));
@@ -909,11 +951,20 @@ function drawTrajectorySvg(points) {
   }
   svgContent += pathSegments;
 
-  // 撃発の瞬間(t≈0)にX印を重ねる
-  const shotPoint = points.reduce((a, b) => Math.abs(b.t) < Math.abs(a.t) ? b : a, points[0]);
-  if (shotPoint) {
-    const sx = CENTER + shotPoint.x * scale, sy = CENTER - shotPoint.y * scale;
-    svgContent += `<text x="${sx}" y="${sy}" font-size="16" fill="#fff" text-anchor="middle" dominant-baseline="central" font-weight="bold">×</text>`;
+  // 撃発の瞬間(t≈0)にX印を重ねる（確定ショット表示時のみ。リアルタイム表示中はまだ撃発していないため表示しない）
+  if (!isLive) {
+    const shotPoint = points.reduce((a, b) => Math.abs(b.t) < Math.abs(a.t) ? b : a, points[0]);
+    if (shotPoint) {
+      const sx = CENTER + shotPoint.x * scale, sy = CENTER - shotPoint.y * scale;
+      svgContent += `<text x="${sx}" y="${sy}" font-size="16" fill="#fff" text-anchor="middle" dominant-baseline="central" font-weight="bold">×</text>`;
+    }
+  } else {
+    // リアルタイム表示中は「現在の銃口位置」を先端の点として小さいマーカーで示す
+    const last = points[points.length - 1];
+    if (last) {
+      const lx = CENTER + last.x * scale, ly = CENTER - last.y * scale;
+      svgContent += `<circle cx="${lx.toFixed(1)}" cy="${ly.toFixed(1)}" r="4" fill="#fbbf24" stroke="#fff" stroke-width="1"/>`;
+    }
   }
 
   svg.innerHTML = svgContent;
