@@ -239,6 +239,25 @@
   📍 今の撃発を手動記録（Mantis確認後に押す）
 </button>
 
+<div class="panel" style="padding:10px 12px;">
+  <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+    <label style="font-size:12px;color:var(--sub);flex-shrink:0;">槓桿動作の不応期:
+      <select id="refractorySelect" style="background:#1a1d22;color:var(--text);border:1px solid var(--border);border-radius:6px;padding:4px 8px;margin-left:4px;">
+        <option value="4" selected>4秒</option>
+        <option value="6">6秒</option>
+        <option value="8">8秒</option>
+        <option value="10">10秒</option>
+      </select>
+    </label>
+  </div>
+  <button id="btnNextShotReady" style="width:100%;margin-top:10px;padding:12px;background:#1a2a1e;border:1px solid var(--good);color:var(--good);border-radius:8px;font-size:14px;font-weight:600;">
+    ✅ 次弾準備完了（不応期を今すぐ解除）
+  </button>
+  <p style="font-size:11px;color:var(--sub);margin:6px 0 0 0;" id="nextShotStatus">
+    撃発後、槓桿操作等が終わって次弾の構えに入ったらこのボタンを押してください。
+  </p>
+</div>
+
 <div class="panel" id="trajectoryPanel">
   <h2>軌跡（照準〜撃発〜フォロースルー）<span id="trajShotNo" style="color:var(--sub);font-weight:400;"></span></h2>
   <div class="traj-wrap"><svg id="trajSvg" viewBox="0 0 320 320"></svg></div>
@@ -254,7 +273,7 @@
 </div>
 
 <div class="panel">
-  <h2>直近ショット</h2>
+  <h2>表示中のショット<span id="displayedShotNo" style="color:var(--sub);font-weight:400;">（リアルタイム）</span></h2>
   <div class="stat-row">
     <div class="stat"><div class="val" id="lastScore">--</div><div class="label">自作D値</div></div>
     <div class="stat"><div class="val" id="lastPeak">--</div><div class="label">最大ブレ(dps)</div></div>
@@ -361,7 +380,7 @@ const LIVE_BUFFER_MAX_MS = PRE_SHOT_MS + POST_SHOT_MS + MANUAL_LOOKBACK_MAX_MS +
 
 let shots = []; // ショット履歴（Mantisスコア・低下原因は後で手入力）
 let lastShotTimestamp = -Infinity;
-const REFRACTORY_MS = 800; // 誤検知の連続カウントを防ぐ不応期（軌跡が長くなった分、間隔も広めに）
+let refractoryMs = 4000; // 誤検知の連続カウントを防ぐ不応期（デフォルト4秒、UIで4/6/8/10秒を選択可能）
 
 // Mantis Xの代表的な診断ラベル（低下原因のプルダウン選択肢）
 const CAUSE_OPTIONS = [
@@ -530,6 +549,12 @@ function updateLiveTrajectory(nowMs) {
   // リアルタイム表示では「今」を撃発とみなし、直近の動きを常に中心基準で描く
   const points = buildTrajectory(windowSamples, nowMs);
   drawTrajectorySvg(points, true);
+
+  // 「表示中のショット」パネルにも、今この瞬間の直近100msのブレ量を反映する
+  const { D, peak } = calcDValue(windowSamples, nowMs);
+  document.getElementById('lastScore').textContent = D.toFixed(2);
+  document.getElementById('lastPeak').textContent = peak.toFixed(1);
+  document.getElementById('lastLabel').textContent = '（リアルタイム中）';
 }
 
 function updateChart(sample) {
@@ -585,7 +610,7 @@ function checkShotDetection(sample) {
   updateDiffChart(diff);
 
   if (diff < params.shotThresh) return;
-  if (sample.t - lastShotTimestamp < REFRACTORY_MS) return; // 不応期中は無視
+  if (sample.t - lastShotTimestamp < refractoryMs) return; // 不応期中は無視（槓桿動作等の誤検知を防ぐ）
 
   lastShotTimestamp = sample.t;
   const t0 = sample.t;
@@ -634,6 +659,30 @@ function manualMarkShot() {
 document.getElementById('btnManualMark').addEventListener('click', manualMarkShot);
 
 // =========================================================
+// 次弾準備完了ボタン：槓桿動作等で不応期を使い切ってしまった場合に、
+// 手動で不応期を即座に解除して次の自動検知を再開できるようにする。
+// =========================================================
+function readyForNextShot() {
+  lastShotTimestamp = -Infinity; // 不応期を即座に解除
+  const statusEl = document.getElementById('nextShotStatus');
+  if (statusEl) {
+    statusEl.textContent = '次弾検知の準備ができました。';
+    statusEl.style.color = 'var(--good)';
+  }
+}
+
+// 不応期（秒）の選択プルダウン
+function bindRefractorySelect() {
+  const el = document.getElementById('refractorySelect');
+  if (!el) return;
+  el.addEventListener('change', () => {
+    refractoryMs = parseInt(el.value) * 1000;
+  });
+}
+bindRefractorySelect();
+document.getElementById('btnNextShotReady').addEventListener('click', readyForNextShot);
+
+// =========================================================
 // 基準姿勢のキャリブレーション（取り付け角度の回転補正）
 // 銃を真下に向けて静止させた状態で押すことで、取り付けの回転ズレ（Z軸まわり）を推定する。
 // 理想的には真下に向けた状態でAccel X/Yはゼロ（重力はZ軸のみにかかる）になるはずだが、
@@ -670,6 +719,20 @@ document.getElementById('btnCalibrate').addEventListener('click', calibrateOrien
 
 // T0の4秒前〜0.5秒後を抽出し、軌跡・暫定D値を計算して履歴に追加する
 // （自作スコア式は未実装。ここではMantisスコアとの突き合わせ用データを残すのみ）
+// 指定した時刻(t0)の直前100msのブレ量D・最大ブレ(peak)を計算する共通関数
+// （確定ショット計算とリアルタイム表示の両方から使う）
+function calcDValue(samples, t0) {
+  const preShotSamples = samples.filter(s => s.t >= t0 - 100 && s.t <= t0);
+  let D = 0, peak = 0;
+  for (let i = 1; i < preShotSamples.length; i++) {
+    const dt = (preShotSamples[i].t - preShotSamples[i - 1].t) / 1000;
+    const { gx, gy } = applyRotationCorrection(preShotSamples[i].gx, preShotSamples[i].gy);
+    D += (Math.abs(gx) + Math.abs(gy)) * dt;
+    peak = Math.max(peak, Math.abs(gx), Math.abs(gy));
+  }
+  return { D, peak };
+}
+
 function processShot(t0, method = 'auto') {
   const windowStart = t0 - PRE_SHOT_MS;
   const windowEnd = t0 + POST_SHOT_MS;
@@ -680,14 +743,7 @@ function processShot(t0, method = 'auto') {
   const trajectory = buildTrajectory(windowSamples, t0);
 
   // 直前100msのブレ量D（暫定指標。自作スコア式ができるまでの参考値）
-  const preShotSamples = windowSamples.filter(s => s.t >= t0 - 100 && s.t <= t0);
-  let D = 0, peak = 0;
-  for (let i = 1; i < preShotSamples.length; i++) {
-    const dt = (preShotSamples[i].t - preShotSamples[i - 1].t) / 1000;
-    const { gx, gy } = applyRotationCorrection(preShotSamples[i].gx, preShotSamples[i].gy);
-    D += (Math.abs(gx) + Math.abs(gy)) * dt;
-    peak = Math.max(peak, Math.abs(gx), Math.abs(gy));
-  }
+  const { D, peak } = calcDValue(windowSamples, t0);
 
   // スコア低下要因の区間分解（表示用の参考値。正式なスコア式ではない）
   const factors = buildFactorBreakdown(windowSamples, t0);
@@ -898,8 +954,10 @@ function showTrajectory(idx) {
   if (!shot) return;
   document.getElementById('trajShotNo').textContent = ` - No.${shot.no}（確定）`;
   document.getElementById('trajModeLabel').textContent = `ショット No.${shot.no} を表示中。しばらくするとリアルタイム表示に戻ります。`;
+  document.getElementById('displayedShotNo').textContent = ` - No.${shot.no}（確定）`;
   drawTrajectorySvg(shot.trajectory);
   renderFactorBars(shot.factors);
+  updateLastShotStats(shot);
 
   trajFrozen = true;
   if (freezeTimeoutHandle) clearTimeout(freezeTimeoutHandle);
@@ -907,6 +965,7 @@ function showTrajectory(idx) {
     trajFrozen = false;
     document.getElementById('trajShotNo').textContent = '';
     document.getElementById('trajModeLabel').textContent = 'リアルタイム表示中：照準の動きをそのまま表示しています。';
+    document.getElementById('displayedShotNo').textContent = '（リアルタイム）';
     document.getElementById('factorBars').innerHTML = '';
   }, FREEZE_DISPLAY_MS);
 }
@@ -918,7 +977,7 @@ function drawTrajectorySvg(points, isLive = false) {
   // 固定スケール：ショット間で見た目の大きさを比較できるよう、全ショット共通の拡大率を使う。
   // FIXED_SCALE_MAX_AMP（積分後の角度[deg]相当）を枠の半径いっぱいに合わせ、
   // これを超える振幅は枠の端でクリップして描画する（はみ出た軌跡は切れる）。
-  const FIXED_SCALE_MAX_AMP = 10; // 実測データ(中央値〜75%ile付近)を基準に設定。合わなければ調整可。
+  const FIXED_SCALE_MAX_AMP = 5; // 実測データを基準に設定。合わなければ調整可。
   const RADIUS = CENTER - 30; // 描画可能な半径（余白30px確保）
   const scale = RADIUS / FIXED_SCALE_MAX_AMP;
 
