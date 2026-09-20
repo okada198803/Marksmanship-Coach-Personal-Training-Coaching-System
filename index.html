@@ -246,6 +246,8 @@
   .t0-modal-desc { font-size: 12px; color: var(--sub); margin: 0 0 10px 0; line-height: 1.4; }
   .t0-chart-wrap { width: 100%; aspect-ratio: 320/140; background: #0a0a0a; border-radius: 8px; touch-action: none; }
   .t0-chart-wrap svg { width: 100%; height: 100%; display: block; }
+  .t0-chart-label { font-size: 11px; color: var(--sub); margin: 8px 0 4px 0; }
+  .t0-chart-zoom { border: 1px solid var(--accent); }
   .t0-modal-status { font-size: 13px; color: var(--accent); text-align: center; margin: 8px 0; font-weight: 600; }
   .t0-modal-buttons { display: flex; gap: 10px; margin-top: 8px; }
   .t0-modal-buttons button { flex: 1; padding: 12px; border-radius: 8px; font-size: 14px; }
@@ -316,11 +318,8 @@
   <label>方向判定の閾値（dps積算）: <span class="val-inline" id="dirThreshVal">8</span>
     <input type="range" id="dirThresh" min="1" max="50" step="1" value="8">
   </label>
-  <label>手動記録：反応時間の探索範囲（秒 遡る）: <span class="val-inline" id="manualLookbackVal">1.5</span>
-    <input type="range" id="manualLookback" min="0.3" max="3.0" step="0.1" value="1.5">
-  </label>
   <p style="font-size:11px;color:var(--sub);margin:4px 0 0 0;">
-    手動ボタン押下時刻からこの秒数分さかのぼった範囲内で、加速度差分の最大ピークを探してT0とします。ピークが見つからない場合のみ、下の固定補正値を使います。
+    手動記録ボタン押下後、直近5秒分の波形を表示し、その中から撃発点をタップで選択・確定します（推定位置は目安として自動表示されます）。
   </p>
   <label>手動記録：ピーク未検出時の固定補正（秒）: <span class="val-inline" id="manualFallbackVal">0.4</span>
     <input type="range" id="manualFallback" min="0.1" max="1.5" step="0.05" value="0.4">
@@ -358,17 +357,21 @@
   </table>
 </div>
 
-<!-- T0確認モーダル：ボタン押下後、推定した撃発タイミング(T0)を波形で確認し、
-     ズレていれば指でタップして修正してから確定する -->
+<!-- T0確認モーダル：ボタン押下後、直近5秒分の波形全体を表示し、その中から
+     本当の撃発タイミング(T0)をタップで選択・修正してから確定する -->
 <div id="t0ConfirmOverlay" class="t0-overlay">
   <div class="t0-modal">
     <h3>撃発タイミングの確認</h3>
     <p class="t0-modal-desc">
-      赤い縦線が推定された撃発の瞬間、赤い点線が検知閾値です。波形のピーク（急激な変化）と
-      ズレている場合は、正しい位置をタップして修正してください。
+      直近5秒間の波形です。まず撃発と思われる位置をタップしてください（下に拡大表示されます）。
+      赤い点線は検知閾値です。拡大表示でさらに正確な位置をタップして微調整できます。
     </p>
     <div class="t0-chart-wrap">
       <svg id="t0ConfirmSvg" viewBox="0 0 320 140"></svg>
+    </div>
+    <p class="t0-chart-label">拡大表示（タップした位置の前後500ms）</p>
+    <div class="t0-chart-wrap t0-chart-zoom">
+      <svg id="t0ConfirmZoomSvg" viewBox="0 0 320 140"></svg>
     </div>
     <p class="t0-modal-status" id="t0ModalStatus">推定T0: --</p>
     <div class="t0-modal-buttons">
@@ -408,8 +411,10 @@ let liveBuffer = []; // 常時ローリングバッファ {t, gx, gy, gz, ax, ay
 // 軌跡切り出し範囲：撃発4秒前 〜 0.5秒後
 const PRE_SHOT_MS = 4000;
 const POST_SHOT_MS = 500;
-const MANUAL_LOOKBACK_MAX_MS = 3000; // 手動マーク時にピークを探す最大遡り範囲（スライダー上限と合わせる）
-const LIVE_BUFFER_MAX_MS = PRE_SHOT_MS + POST_SHOT_MS + MANUAL_LOOKBACK_MAX_MS + 500; // 手動マークのピーク探索＋軌跡切り出し分を確保
+// バッファ保持時間：T0確認モーダルでの探索範囲（ボタン押下時刻から遡って5秒）に加え、
+// 選択したT0から軌跡切り出し（撃発4秒前〜0.5秒後）分のデータも必要になるため、
+// 両方を確保できる長さを保持する。
+const LIVE_BUFFER_MAX_MS = 5000 + PRE_SHOT_MS + POST_SHOT_MS + 500;
 
 let shots = []; // ショット履歴（Mantisスコア・低下原因は後で手入力）
 
@@ -442,7 +447,6 @@ let params = {
   dmin: 2.0,
   dmax: 40,
   dirThresh: 8,
-  manualLookback: 1.5, // 秒。手動マーク時にこの範囲を遡ってピークを探す
   manualFallback: 0.4, // 秒。ピークが見つからない場合の固定補正値
 };
 
@@ -720,9 +724,11 @@ document.getElementById('btnManualMark').addEventListener('click', manualMarkSho
 let t0ModalState = null; // { pressTime, method, samples, selectedT0 }
 
 
-function openT0ConfirmModal(estimatedT0, method, viaThreshold) {
-  const windowStart = estimatedT0 - T0_MODAL_WINDOW_MS;
-  const windowEnd = estimatedT0 + T0_MODAL_WINDOW_MS;
+function openT0ConfirmModal(estimatedT0, method, viaThreshold, pressTime) {
+  // 表示範囲：ボタン押下時刻から遡って直近5秒間（T0_SEARCH_WINDOW_MS）。
+  // 撃発候補を広く探せるよう、推定T0周辺だけでなく押下時点までの全体を見せる。
+  const windowStart = pressTime - T0_SEARCH_WINDOW_MS;
+  const windowEnd = pressTime;
   const samples = liveBuffer.filter(s => s.t >= windowStart && s.t <= windowEnd);
 
   if (samples.length < 2) {
@@ -740,8 +746,11 @@ function closeT0ConfirmModal() {
   t0ModalState = null;
 }
 
-// 波形（加速度差分）と現在選択中のT0（赤線）を描画する。タップ位置をT0候補として扱う。
-// 自動検知の閾値ラインも点線で表示し、どのピークが閾値を超えているか目視確認できるようにする。
+const ZOOM_HALF_WIDTH_MS = 500; // 拡大表示の範囲：選択位置の前後500ms（計1秒）
+
+// 波形（加速度差分）全体（直近5秒）を描画する。タップした位置を拡大表示に反映する。
+// 5秒分を320px幅に描くため、ここでのタップは「だいたいこのあたり」の粗い選択に留め、
+// 正確な位置決めは拡大表示（drawT0ZoomChart）側のタップで行う。
 function drawT0ConfirmChart() {
   if (!t0ModalState) return;
   const { samples, selectedT0, viaThreshold } = t0ModalState;
@@ -775,19 +784,72 @@ function drawT0ConfirmChart() {
   document.getElementById('t0ModalStatus').textContent =
     `選択中の撃発点: ${selectedT0 > 0 ? '+' : ''}${Math.round(selectedT0)}ms ${basisText}`;
 
-  // タップ/クリックで選択位置を更新できるようにする（要素ごとに座標系が変わるため毎回計算）
+  // タップ/クリックで大まかな位置を選択 → 拡大表示に反映する
   svg.onclick = (evt) => {
     const rect = svg.getBoundingClientRect();
     const relX = (evt.clientX - rect.left) / rect.width * W;
     const ratio = Math.max(0, Math.min(1, (relX - PAD) / (W - 2 * PAD)));
     const tappedT = tMin + ratio * (tMax - tMin);
-    // タップ位置に最も近い実サンプルの時刻にスナップする
     const nearest = samples.reduce((a, b) =>
       Math.abs(b.t - tappedT) < Math.abs(a.t - tappedT) ? b : a, samples[0]);
     t0ModalState.selectedT0 = nearest.t;
     drawT0ConfirmChart();
+    drawT0ZoomChart();
+  };
+
+  drawT0ZoomChart();
+}
+
+// 選択中のT0の前後ZOOM_HALF_WIDTH_MSを拡大表示し、正確な位置決めをできるようにする。
+function drawT0ZoomChart() {
+  if (!t0ModalState) return;
+  const { samples, selectedT0 } = t0ModalState;
+  const svg = document.getElementById('t0ConfirmZoomSvg');
+  const W = 320, H = 140, PAD = 10;
+
+  const zoomStart = selectedT0 - ZOOM_HALF_WIDTH_MS;
+  const zoomEnd = selectedT0 + ZOOM_HALF_WIDTH_MS;
+  const zoomSamples = samples.filter(s => s.t >= zoomStart && s.t <= zoomEnd);
+
+  if (zoomSamples.length < 2) {
+    svg.innerHTML = '';
+    return;
+  }
+
+  const tMin = zoomStart, tMax = zoomEnd;
+  const diffs = zoomSamples.map(s => s.diff || 0);
+  const diffMax = Math.max(0.01, params.shotThresh * 1.2, ...diffs);
+
+  const xOf = (t) => PAD + (t - tMin) / (tMax - tMin) * (W - 2 * PAD);
+  const yOf = (d) => H - PAD - (d / diffMax) * (H - 2 * PAD);
+
+  let path = '';
+  zoomSamples.forEach((s, i) => {
+    const x = xOf(s.t).toFixed(1), y = yOf(s.diff || 0).toFixed(1);
+    path += (i === 0 ? 'M' : 'L') + x + ',' + y + ' ';
+  });
+
+  const selX = xOf(selectedT0).toFixed(1);
+  const threshY = yOf(params.shotThresh).toFixed(1);
+
+  let svgContent = `<line x1="0" y1="${threshY}" x2="${W}" y2="${threshY}" stroke="#f87171" stroke-width="1" stroke-dasharray="4,4" opacity="0.6"/>`;
+  svgContent += `<path d="${path}" stroke="var(--accent)" stroke-width="1.5" fill="none"/>`;
+  svgContent += `<line x1="${selX}" y1="0" x2="${selX}" y2="${H}" stroke="#f87171" stroke-width="2"/>`;
+  svg.innerHTML = svgContent;
+
+  // 拡大表示側のタップで、正確な位置決めを行う
+  svg.onclick = (evt) => {
+    const rect = svg.getBoundingClientRect();
+    const relX = (evt.clientX - rect.left) / rect.width * W;
+    const ratio = Math.max(0, Math.min(1, (relX - PAD) / (W - 2 * PAD)));
+    const tappedT = tMin + ratio * (tMax - tMin);
+    const nearest = zoomSamples.reduce((a, b) =>
+      Math.abs(b.t - tappedT) < Math.abs(a.t - tappedT) ? b : a, zoomSamples[0]);
+    t0ModalState.selectedT0 = nearest.t;
+    drawT0ConfirmChart(); // 全体表示側の赤線位置とステータス表示も更新するため再描画
   };
 }
+
 
 document.getElementById('btnT0Cancel').addEventListener('click', closeT0ConfirmModal);
 document.getElementById('btnT0Confirm').addEventListener('click', () => {
@@ -1292,7 +1354,6 @@ bindSlider('shotThresh', 'shotThreshVal', 'shotThresh', false);
 bindSlider('dmin', 'dminVal', 'dmin', false);
 bindSlider('dmax', 'dmaxVal', 'dmax', true);
 bindSlider('dirThresh', 'dirThreshVal', 'dirThresh', true);
-bindSlider('manualLookback', 'manualLookbackVal', 'manualLookback', false);
 bindSlider('manualFallback', 'manualFallbackVal', 'manualFallback', false);
 
 // =========================================================
