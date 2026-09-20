@@ -958,6 +958,76 @@ function processShot(t0, method = 'auto') {
   showTrajectory(0); // 最新ショットを自動表示
 }
 
+// =========================================================
+// クォータニオンによる姿勢追跡（銃口の絶対的な向きをトレースする）
+//
+// 【背景】従来はGyroX/Yを単純に時間積分していたが、これはセンサーの
+// ローカル座標系での回転量の累積に過ぎない。銃を傾ける（ロールさせる）
+// と、その傾きの分だけX/Y成分が混ざり合ってしまい、「銃口を左右に
+// 振っていないのに傾けるだけで軌跡が左右に動く」という実機での確認結果と
+// 一致する問題があった（ジンバルロックに類似した、単純角速度積分の
+// 原理的な限界）。
+//
+// 【対応】GyroX/Y/Zの3軸角速度からクォータニオンで姿勢を逐次更新し、
+// 「銃口が今どの方向を向いているか（絶対姿勢）」を追跡する方式に変更。
+// 軌跡には、この姿勢から算出した水平方向（パン）・垂直方向（チルト）の
+// 基準姿勢からのズレのみを反映し、ロール（銃身軸まわりのひねり）成分は
+// 軌跡に混入させない。
+// =========================================================
+
+// クォータニオンの積（q1 * q2）
+function quatMultiply(q1, q2) {
+  return {
+    w: q1.w * q2.w - q1.x * q2.x - q1.y * q2.y - q1.z * q2.z,
+    x: q1.w * q2.x + q1.x * q2.w + q1.y * q2.z - q1.z * q2.y,
+    y: q1.w * q2.y - q1.x * q2.z + q1.y * q2.w + q1.z * q2.x,
+    z: q1.w * q2.z + q1.x * q2.y - q1.y * q2.x + q1.z * q2.w,
+  };
+}
+
+// クォータニオンの正規化（数値誤差の蓄積による歪みを防ぐため毎回行う）
+function quatNormalize(q) {
+  const norm = Math.sqrt(q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z);
+  if (norm < 1e-9) return { w: 1, x: 0, y: 0, z: 0 };
+  return { w: q.w / norm, x: q.x / norm, y: q.y / norm, z: q.z / norm };
+}
+
+// 角速度ベクトル（deg/s）と時間刻み(秒)から、微小回転を表すクォータニオンを作る
+function quatFromAngularVelocity(gx, gy, gz, dt) {
+  // deg/s -> rad/s に変換してから積分角を求める
+  const wx = gx * Math.PI / 180, wy = gy * Math.PI / 180, wz = gz * Math.PI / 180;
+  const angle = Math.sqrt(wx * wx + wy * wy + wz * wz) * dt; // この時間刻みでの回転角(rad)
+  if (angle < 1e-9) return { w: 1, x: 0, y: 0, z: 0 };
+  const axisNorm = Math.sqrt(wx * wx + wy * wy + wz * wz);
+  const sinHalf = Math.sin(angle / 2);
+  return {
+    w: Math.cos(angle / 2),
+    x: (wx / axisNorm) * sinHalf,
+    y: (wy / axisNorm) * sinHalf,
+    z: (wz / axisNorm) * sinHalf,
+  };
+}
+
+// 姿勢クォータニオンから、基準姿勢(単位クォータニオン)に対する
+// 水平方向(パン)・垂直方向(チルト)のズレ角(deg)を取り出す。
+// センサーのローカルZ軸(銃身軸に垂直、前方を指すベクトルの基準)を
+// 現在の姿勢で回転させ、その向きから角度を算出する。
+function quatToPanTilt(q) {
+  // ローカル座標系での「前方向」基準ベクトル(0,1,0)をYを銃身軸として採用
+  // (座標系確定：センサーY軸=前後・銃身軸)。このベクトルを姿勢qで回転させる。
+  const vx = 0, vy = 1, vz = 0;
+  // q * v * q^-1 （vをクォータニオンとして扱い回転させる）
+  const qv = { w: 0, x: vx, y: vy, z: vz };
+  const qConj = { w: q.w, x: -q.x, y: -q.y, z: -q.z };
+  const rotated = quatMultiply(quatMultiply(q, qv), qConj);
+  // 回転後の前方ベクトル(rotated.x, rotated.y, rotated.z)から、
+  // 水平方向のズレ(pan、X-Y平面内)・垂直方向のズレ(tilt、Z方向)を角度として算出
+  const pan = Math.atan2(rotated.x, rotated.y) * 180 / Math.PI;   // 左右のズレ
+  const horizDist = Math.sqrt(rotated.x * rotated.x + rotated.y * rotated.y);
+  const tilt = Math.atan2(rotated.z, horizDist) * 180 / Math.PI;  // 上下のズレ
+  return { pan, tilt };
+}
+
 // 取り付けの回転ズレを打ち消す向きにGyro X/Yを回転補正する（キャリブレーション未実施なら無補正）
 function applyRotationCorrection(gx, gy) {
   if (!calibration) return { gx, gy };
@@ -969,26 +1039,24 @@ function applyRotationCorrection(gx, gy) {
   };
 }
 
-// Gyro X/Yを単純積分して相対角度（deg相当）に変換し、SVG座標系にマッピングする。
-// キャリブレーション済みの場合、取り付けの回転角分だけGyro X/Yを回転補正してから積分する。
-// 原点（0,0）は撃発の瞬間（T0）とする：積分自体は時系列順（撃発4秒前始点）に行い、
-// 後からT0時点の値を全体から差し引いて原点をシフトする（Mantis DHOT表示に合わせるため）。
-//
-// 【符号補正】実機でのリアルタイム軌跡確認により、GyroYの積分値をそのまま上下(y)に
-// 使うと実際の銃口の動きと上下が逆になることが判明した（銃口を上に振ると画面上は下に
-// 動く）。左右(GyroX由来のx)は実機と一致していたため、y成分のみ符号を反転させる。
+// GyroX/Y/Zからクォータニオンで姿勢を逐次追跡し、各時点の銃口方向(パン・チルト)を
+// SVG座標系にマッピングする。原点（0,0）は撃発の瞬間（T0）とする：
+// 姿勢の積算自体は時系列順（撃発4秒前始点）に行い、後からT0時点の値を
+// 全体から差し引いて原点をシフトする（Mantis DHOT表示に合わせるため）。
 function buildTrajectory(samples, t0) {
-  let angleX = 0, angleY = 0; // 積算角度（撃発4秒前を仮の原点として積分）
+  let orientation = { w: 1, x: 0, y: 0, z: 0 }; // 基準姿勢（撃発4秒前を仮の原点）
   const rawPoints = [];
   for (let i = 1; i < samples.length; i++) {
     const dt = (samples[i].t - samples[i - 1].t) / 1000;
     const { gx, gy } = applyRotationCorrection(samples[i].gx, samples[i].gy);
-    angleX += gx * dt;
-    angleY += gy * dt;
+    const gz = samples[i].gz;
+    const dq = quatFromAngularVelocity(gx, gy, gz, dt);
+    orientation = quatNormalize(quatMultiply(orientation, dq));
+    const { pan, tilt } = quatToPanTilt(orientation);
     rawPoints.push({
       t: samples[i].t - t0, // 撃発を基準(0)とした相対時刻
-      x: angleX,
-      y: -angleY, // 符号反転（実機の上下方向と一致させる）
+      x: pan,
+      y: tilt,
     });
   }
 
