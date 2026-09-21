@@ -302,6 +302,9 @@
   <p style="font-size:11px;color:var(--sub);margin:-6px 0 12px 0;" id="calibStatus">
     未実施：BLE接続後、銃に装着する前に静止させた状態で一度押してください（ジャイロのゼロ点ズレによるドリフトを補正します）。
   </p>
+  <label>軌跡表示の倍率（枠の半径に対応する角度[deg]・小さいほど拡大表示）: <span class="val-inline" id="trajScaleVal">5</span>
+    <input type="range" id="trajScale" min="1" max="15" step="0.5" value="5">
+  </label>
   <label>デバッグ波形の目安ライン（加速度差分 G/サンプル）: <span class="val-inline" id="shotThreshVal">0.15</span>
     <input type="range" id="shotThresh" min="0.02" max="1.0" step="0.01" value="0.15">
   </label>
@@ -448,6 +451,7 @@ let params = {
   dmax: 40,
   dirThresh: 8,
   manualFallback: 0.4, // 秒。ピークが見つからない場合の固定補正値
+  trajScale: 5, // 軌跡表示の倍率設定（枠の半径に対応する角度[deg]。旧FIXED_SCALE_MAX_AMP）
 };
 
 let prevAccelMag = null; // 差分計算用に直前サンプルの合成加速度を保持
@@ -1349,11 +1353,11 @@ function drawTrajectorySvg(points, isLive = false) {
   const SIZE = 320, CENTER = 160;
 
   // 固定スケール：ショット間で見た目の大きさを比較できるよう、全ショット共通の拡大率を使う。
-  // FIXED_SCALE_MAX_AMP（積分後の角度[deg]相当）を枠の半径いっぱいに合わせ、
+  // params.trajScale（積分後の角度[deg]相当）を枠の半径いっぱいに合わせ、
   // これを超える振幅は枠の端でクリップして描画する（はみ出た軌跡は切れる）。
-  const FIXED_SCALE_MAX_AMP = 5; // 実測データを基準に設定。合わなければ調整可。
+  // キャリブレーション設定パネルのスライダーで調整可能（旧FIXED_SCALE_MAX_AMP固定値5から変更）。
   const RADIUS = CENTER - 30; // 描画可能な半径（余白30px確保）
-  const scale = RADIUS / FIXED_SCALE_MAX_AMP;
+  const scale = RADIUS / params.trajScale;
 
   // 中心からの距離がRADIUSを超える点は、その方向のままRADIUS上にクリップする
   function clipToRadius(px, py) {
@@ -1447,6 +1451,7 @@ bindSlider('dmin', 'dminVal', 'dmin', false);
 bindSlider('dmax', 'dmaxVal', 'dmax', true);
 bindSlider('dirThresh', 'dirThreshVal', 'dirThresh', true);
 bindSlider('manualFallback', 'manualFallbackVal', 'manualFallback', false);
+bindSlider('trajScale', 'trajScaleVal', 'trajScale', false);
 
 // =========================================================
 // HUDモード（スマートグラス表示想定：黒背景・高コントラスト）
