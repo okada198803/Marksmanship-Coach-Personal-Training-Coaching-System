@@ -297,10 +297,10 @@
 <div class="panel settings">
   <h2>キャリブレーション設定</h2>
   <button id="btnCalibrate" style="width:100%;margin-bottom:12px;background:#1a2a28;border-color:var(--accent);color:var(--accent);">
-    📐 基準姿勢を記録（銃口を真下に向けて静止させて押す）
+    📐 静止バイアスを記録（銃に装着する前、置いた状態で押す）
   </button>
   <p style="font-size:11px;color:var(--sub);margin:-6px 0 12px 0;" id="calibStatus">
-    未実施：取り付け後、銃を真下に向けて静止させた状態で一度押してください（取り付けの回転ズレを補正します）。
+    未実施：BLE接続後、銃に装着する前に静止させた状態で一度押してください（ジャイロのゼロ点ズレによるドリフトを補正します）。
   </p>
   <label>デバッグ波形の目安ライン（加速度差分 G/サンプル）: <span class="val-inline" id="shotThreshVal">0.15</span>
     <input type="range" id="shotThresh" min="0.02" max="1.0" step="0.01" value="0.15">
@@ -452,11 +452,13 @@ let params = {
 
 let prevAccelMag = null; // 差分計算用に直前サンプルの合成加速度を保持
 
-// ---- 基準姿勢（キャリブレーション） ----
-// 取り付け直後に静止させて記録した加速度を基準として保持する。
-// Gyro積分（軌跡描画）自体は変化量なので基準の影響は受けないが、
-// 将来Accelから静的な傾き（重力方向）を使った補正・診断を行う際の土台として保存しておく。
-let calibration = null; // { ax, ay, az } または null（未実施）
+// ---- ジャイロ静止バイアス（キャリブレーション） ----
+// 接続直後・銃に装着する前の静止状態で記録したGyroX/Y/Zの平均値。
+// ジャイロのゼロ点オフセットにより、静止していても積分値が一定方向に
+// ドリフトし続ける現象が確認されたため、以降の全ての積分・ブレ量計算で
+// この値を差し引いて使用する。
+let gyroBias = { gx: 0, gy: 0, gz: 0 }; // 未実施時はゼロ（補正なし）
+let gyroBiasCalibrated = false;
 
 // ---- Chart.js セットアップ ----
 const ctx = document.getElementById('liveChart').getContext('2d');
@@ -863,12 +865,13 @@ document.getElementById('btnT0Confirm').addEventListener('click', () => {
 
 // =========================================================
 // 基準姿勢のキャリブレーション（取り付け角度の回転補正）
-// 銃を真下に向けて静止させた状態で押すことで、取り付けの回転ズレ（Z軸まわり）を推定する。
-// 理想的には真下に向けた状態でAccel X/Yはゼロ（重力はZ軸のみにかかる）になるはずだが、
-// センサーが斜めに付いていると、その分だけX/Yに重力成分が漏れ出る。このズレ角を
-// 「取り付けの回転角」とみなし、以降の軌跡描画（Gyro X/Y積分）に補正として適用する。
+// 銃に装着する前、静止させた状態で押すことで、ジャイロのゼロ点オフセット（バイアス）を推定する。
+// 理想的には静止状態でGyroX/Y/Zはすべてゼロになるはずだが、実際にはセンサー固有の
+// ゼロ点ズレが乗っており、これを積分し続けると静止中でも軌跡が一定方向に流れ続ける
+// （ドリフト）原因になる。ここで求めたバイアスを以降の全ての角速度使用箇所
+// （buildTrajectory・calcDValue・buildFactorBreakdown・各種ヒント判定）で差し引く。
 // =========================================================
-const CALIB_SAMPLE_COUNT = 20; // 直近何サンプルを平均するか（ノイズ低減のため）
+const CALIB_SAMPLE_COUNT = 100; // 直近何サンプルを平均するか（100Hz想定で約1秒、ノイズ低減のため）
 
 function calibrateOrientation() {
   if (liveBuffer.length < CALIB_SAMPLE_COUNT) {
@@ -877,24 +880,23 @@ function calibrateOrientation() {
   }
   const recent = liveBuffer.slice(-CALIB_SAMPLE_COUNT);
   const avg = recent.reduce((acc, s) => {
-    acc.ax += s.ax; acc.ay += s.ay; acc.az += s.az;
+    acc.gx += s.gx; acc.gy += s.gy; acc.gz += s.gz;
     return acc;
-  }, { ax: 0, ay: 0, az: 0 });
-  const ax = avg.ax / recent.length;
-  const ay = avg.ay / recent.length;
-  const az = avg.az / recent.length;
+  }, { gx: 0, gy: 0, gz: 0 });
+  const gx = avg.gx / recent.length;
+  const gy = avg.gy / recent.length;
+  const gz = avg.gz / recent.length;
 
-  // 真下に向けた状態でX/Yに漏れ出た重力成分から、取り付けの回転角（ラジアン）を算出
-  const rotationAngle = Math.atan2(ay, ax);
-
-  calibration = { ax, ay, az, rotationAngle };
+  gyroBias = { gx, gy, gz };
+  gyroBiasCalibrated = true;
   const statusEl = document.getElementById('calibStatus');
-  const degrees = (rotationAngle * 180 / Math.PI).toFixed(1);
-  statusEl.textContent = `記録済み：取り付け回転角 ${degrees}° （基準Accel: ${ax.toFixed(2)}, ${ay.toFixed(2)}, ${az.toFixed(2)} G）`;
+  statusEl.textContent = `記録済み：静止バイアス GyroX=${gx.toFixed(2)}, GyroY=${gy.toFixed(2)}, GyroZ=${gz.toFixed(2)} dps`;
   statusEl.style.color = 'var(--good)';
 }
 
 document.getElementById('btnCalibrate').addEventListener('click', calibrateOrientation);
+
+
 
 // T0の4秒前〜0.5秒後を抽出し、軌跡・暫定D値を計算して履歴に追加する
 // （自作スコア式は未実装。ここではMantisスコアとの突き合わせ用データを残すのみ）
@@ -905,7 +907,7 @@ function calcDValue(samples, t0) {
   let D = 0, peak = 0;
   for (let i = 1; i < preShotSamples.length; i++) {
     const dt = (preShotSamples[i].t - preShotSamples[i - 1].t) / 1000;
-    const { gx, gy } = applyRotationCorrection(preShotSamples[i].gx, preShotSamples[i].gy);
+    const { gx, gy } = applyGyroBias(preShotSamples[i].gx, preShotSamples[i].gy, preShotSamples[i].gz);
     D += (Math.abs(gx) + Math.abs(gy)) * dt;
     peak = Math.max(peak, Math.abs(gx), Math.abs(gy));
   }
@@ -1045,17 +1047,21 @@ function quatToPanTilt(q) {
   return { pan, tilt };
 }
 
-// 取り付けの回転ズレを打ち消す向きにGyro X/Yを回転補正する関数。
+// 静止バイアスを差し引く関数。GyroX/Y/Zの3軸すべてに適用する。
 //
-// 【一時無効化】実機での軸対応確認により、GyroX=ロール軸、GyroY=上下軸
-// という、想定と異なる（かつ性質の異なる）2軸であることが判明した。
-// 本来この関数は「同一平面内（左右・前後）の取り付け角度ズレ」を
-// 補正するためのものであり、ロール軸と上下軸の間で単純な平面回転補正を
-// かけるのは意味を成さない。実測されたキャリブレーション回転角は
-// 数度程度と小さく影響は軽微なため、軸対応の訂正に伴い一旦補正の適用を
-// 停止する（キャリブレーション自体の記録機能は維持）。
-function applyRotationCorrection(gx, gy) {
-  return { gx, gy };
+// 【経緯】以前はここで取り付け角度の回転補正（GyroX/Y平面の回転ズレ補正）を
+// 行っていたが、実機での軸対応確認によりGyroX=ロール軸、GyroY=上下軸という
+// 性質の異なる2軸であることが判明し、平面回転補正の設計自体が意味を成さなく
+// なったため無効化した。その後、静止状態でも軌跡が一定方向にドリフトする
+// 問題が確認され、原因はジャイロのゼロ点オフセットと判明。取り付け角度補正の
+// 代わりに、装着前の静止状態で記録したバイアス（gyroBias）を差し引く処理に
+// 置き換えた。
+function applyGyroBias(gx, gy, gz) {
+  return {
+    gx: gx - gyroBias.gx,
+    gy: gy - gyroBias.gy,
+    gz: gz - gyroBias.gz,
+  };
 }
 
 // GyroX/Y/Zからクォータニオンで姿勢を逐次追跡し、各時点の銃口方向(パン・チルト)を
@@ -1067,8 +1073,7 @@ function buildTrajectory(samples, t0) {
   const rawPoints = [];
   for (let i = 1; i < samples.length; i++) {
     const dt = (samples[i].t - samples[i - 1].t) / 1000;
-    const { gx, gy } = applyRotationCorrection(samples[i].gx, samples[i].gy);
-    const gz = samples[i].gz;
+    const { gx, gy, gz } = applyGyroBias(samples[i].gx, samples[i].gy, samples[i].gz);
     const dq = quatFromAngularVelocity(gx, gy, gz, dt);
     orientation = quatNormalize(quatMultiply(orientation, dq));
     const { pan, tilt } = quatToPanTilt(orientation);
@@ -1134,7 +1139,7 @@ function checkReboundAnticipationHint(samples, t0) {
 
   const magMean = (arr) => {
     const mags = arr.map(s => {
-      const { gx, gy } = applyRotationCorrection(s.gx, s.gy);
+      const { gx, gy } = applyGyroBias(s.gx, s.gy, s.gz);
       return Math.sqrt(gx * gx + gy * gy);
     });
     return mags.reduce((a, b) => a + b, 0) / mags.length;
@@ -1165,7 +1170,7 @@ function buildFactorBreakdown(samples, t0) {
     let sum = 0;
     for (let i = 1; i < segSamples.length; i++) {
       const dt = (segSamples[i].t - segSamples[i - 1].t) / 1000;
-      const { gx, gy } = applyRotationCorrection(segSamples[i].gx, segSamples[i].gy);
+      const { gx, gy } = applyGyroBias(segSamples[i].gx, segSamples[i].gy, segSamples[i].gz);
       sum += (Math.abs(gx) + Math.abs(gy)) * dt;
     }
     return { label: seg.label, value: sum };
@@ -1463,9 +1468,9 @@ function updateHud(shot) {
 function buildCsv() {
   // Mantisスコアと自作側の生データ(D値・軌跡)を突き合わせられる形式で出力する。
   // 将来この対応データから自作スコア式の閾値(Dmin/Dmax等)を決定する。
-  const calibLine = calibration
-    ? `# 基準姿勢(Accel G): ax=${calibration.ax.toFixed(3)}, ay=${calibration.ay.toFixed(3)}, az=${calibration.az.toFixed(3)}, 取り付け回転角=${(calibration.rotationAngle * 180 / Math.PI).toFixed(1)}度\n`
-    : '# 基準姿勢: 未記録\n';
+  const calibLine = gyroBiasCalibrated
+    ? `# 静止バイアス(dps): GyroX=${gyroBias.gx.toFixed(3)}, GyroY=${gyroBias.gy.toFixed(3)}, GyroZ=${gyroBias.gz.toFixed(3)}\n`
+    : '# 静止バイアス: 未記録\n';
   const header = 'No,時刻,検知方式,Mantisスコア,低下原因,最大ブレdps,ブレ量D,反動予期ヒント,フォロー減衰比,突き出しヒント,直前1秒spreadX,軌跡X,軌跡Y,軌跡t_ms,波形GyroX,波形GyroY,波形GyroZ,波形AccelX,波形AccelY,波形AccelZ\n';
   const rows = shots.map(s => {
     const cause = s.cause === 'その他（自由入力）' ? s.causeFreeText : s.cause;
