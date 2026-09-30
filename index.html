@@ -222,7 +222,8 @@
   #hudOverlay .hud-live .bar { display: inline-block; width: 60vw; height: 6px; background: #222; position: relative; vertical-align: middle; margin: 0 8px; }
   #hudOverlay .hud-live .bar .marker { position: absolute; top: -4px; width: 4px; height: 14px; background: var(--accent); }
 
-  /* T0確認モーダル：ボタン押下後、波形を見てT0をタップ修正するための画面 */
+  /* T0確認モーダル：ボタン押下後、波形を見てT0をタップ修正し、
+     続けてスコア・低下原因も入力してから記録を確定する画面 */
   .t0-overlay {
     display: none;
     position: fixed;
@@ -231,25 +232,51 @@
     z-index: 998;
     align-items: center;
     justify-content: center;
-    padding: 16px;
+    padding: 12px;
   }
   .t0-overlay.active { display: flex; }
   .t0-modal {
     background: var(--panel);
     border: 1px solid var(--border);
     border-radius: 12px;
-    padding: 16px;
+    padding: 14px;
     width: 100%;
     max-width: 380px;
+    max-height: 96vh;
+    overflow-y: auto;
   }
-  .t0-modal h3 { margin: 0 0 8px 0; font-size: 15px; }
-  .t0-modal-desc { font-size: 12px; color: var(--sub); margin: 0 0 10px 0; line-height: 1.4; }
-  .t0-chart-wrap { width: 100%; aspect-ratio: 320/140; background: #0a0a0a; border-radius: 8px; touch-action: none; }
+  .t0-modal h3 { margin: 0 0 6px 0; font-size: 14px; }
+  .t0-modal-desc { font-size: 11px; color: var(--sub); margin: 0 0 8px 0; line-height: 1.3; }
+  .t0-chart-wrap { width: 100%; aspect-ratio: 320/100; background: #0a0a0a; border-radius: 8px; touch-action: none; }
   .t0-chart-wrap svg { width: 100%; height: 100%; display: block; }
-  .t0-chart-label { font-size: 11px; color: var(--sub); margin: 8px 0 4px 0; }
+  .t0-chart-label { font-size: 10px; color: var(--sub); margin: 6px 0 3px 0; }
   .t0-chart-zoom { border: 1px solid var(--accent); }
-  .t0-modal-status { font-size: 13px; color: var(--accent); text-align: center; margin: 8px 0; font-weight: 600; }
-  .t0-modal-buttons { display: flex; gap: 10px; margin-top: 8px; }
+  .t0-modal-status { font-size: 12px; color: var(--accent); text-align: center; margin: 6px 0; font-weight: 600; }
+  .t0-eval-section {
+    margin-top: 10px;
+    padding-top: 10px;
+    border-top: 1px solid var(--border);
+  }
+  .t0-eval-row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 8px;
+  }
+  .t0-eval-row label { font-size: 12px; color: var(--sub); flex-shrink: 0; width: 66px; }
+  .t0-eval-row input[type="number"] {
+    flex: 1; background: #1a1d22; color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 8px; font-size: 14px; width: 100%;
+  }
+  .t0-eval-row select {
+    flex: 1; background: #1a1d22; color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 8px; font-size: 13px; width: 100%;
+  }
+  .t0-eval-freetext {
+    width: 100%; background: #1a1d22; color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 8px; font-size: 13px; margin-top: 6px; display: block;
+  }
+  .t0-modal-buttons { display: flex; gap: 10px; margin-top: 10px; }
   .t0-modal-buttons button { flex: 1; padding: 12px; border-radius: 8px; font-size: 14px; }
   .t0-btn-cancel { background: var(--panel); border: 1px solid var(--border); color: var(--sub); }
   .t0-btn-confirm { background: var(--accent); color: #0a0a0a; border: none; font-weight: 700; }
@@ -364,10 +391,9 @@
      本当の撃発タイミング(T0)をタップで選択・修正してから確定する -->
 <div id="t0ConfirmOverlay" class="t0-overlay">
   <div class="t0-modal">
-    <h3>撃発タイミングの確認</h3>
+    <h3>撃発タイミングの確認・評価入力</h3>
     <p class="t0-modal-desc">
-      直近5秒間の波形です。まず撃発と思われる位置をタップしてください（下に拡大表示されます）。
-      赤い点線は検知閾値です。拡大表示でさらに正確な位置をタップして微調整できます。
+      撃発位置をタップして選択・微調整し（赤点線=検知閾値）、Mantisスコア・低下原因も入力してから確定してください。
     </p>
     <div class="t0-chart-wrap">
       <svg id="t0ConfirmSvg" viewBox="0 0 320 140"></svg>
@@ -377,6 +403,19 @@
       <svg id="t0ConfirmZoomSvg" viewBox="0 0 320 140"></svg>
     </div>
     <p class="t0-modal-status" id="t0ModalStatus">推定T0: --</p>
+
+    <div class="t0-eval-section">
+      <div class="t0-eval-row">
+        <label>Mantisスコア</label>
+        <input type="number" id="t0EvalScore" min="0" max="100" step="0.1" placeholder="--">
+      </div>
+      <div class="t0-eval-row">
+        <label>低下原因</label>
+        <select id="t0EvalCause"></select>
+      </div>
+      <input type="text" id="t0EvalCauseFreeText" class="t0-eval-freetext" placeholder="内容を入力" style="display:none;">
+    </div>
+
     <div class="t0-modal-buttons">
       <button id="btnT0Cancel" class="t0-btn-cancel">取消し</button>
       <button id="btnT0Confirm" class="t0-btn-confirm">この位置で記録</button>
@@ -415,9 +454,14 @@ let liveBuffer = []; // 常時ローリングバッファ {t, gx, gy, gz, ax, ay
 const PRE_SHOT_MS = 4000;
 const POST_SHOT_MS = 500;
 // バッファ保持時間：T0確認モーダルでの探索範囲（ボタン押下時刻から遡って5秒）に加え、
-// 選択したT0から軌跡切り出し（撃発4秒前〜0.5秒後）分のデータも必要になるため、
-// 両方を確保できる長さを保持する。
-const LIVE_BUFFER_MAX_MS = 5000 + PRE_SHOT_MS + POST_SHOT_MS + 500;
+// 選択したT0から軌跡切り出し（撃発4秒前〜0.5秒後）分のデータも必要になる。
+// さらに、モーダルを開いてから目視確認・タップでの位置調整を経て確定ボタンを押すまでの
+// 時間（実運用で10秒程度かかることが確認されたため、余裕を見て15秒）を見込んでおかないと、
+// 確定時点でliveBufferから該当区間のデータが既に破棄されており、windowSamplesが不足して
+// 無音で保存に失敗する（processShot内のlength<2チェックでreturnするだけでエラー通知がない）
+// 問題があった。これを避けるため、確認・調整にかかる時間の余裕分を追加で確保する。
+const MODAL_CONFIRM_MARGIN_MS = 15000; // モーダルでの確認・タップ調整にかかる時間の余裕
+const LIVE_BUFFER_MAX_MS = 5000 + PRE_SHOT_MS + POST_SHOT_MS + 500 + MODAL_CONFIRM_MARGIN_MS;
 
 let shots = []; // ショット履歴（Mantisスコア・低下原因は後で手入力）
 
@@ -456,6 +500,10 @@ let params = {
 
 let prevAccelMag = null; // 差分計算用に直前サンプルの合成加速度を保持
 
+// ---- 基準姿勢（キャリブレーション） ----
+// 取り付け直後に静止させて記録した加速度を基準として保持する。
+// Gyro積分（軌跡描画）自体は変化量なので基準の影響は受けないが、
+// 将来Accelから静的な傾き（重力方向）を使った補正・診断を行う際の土台として保存しておく。
 // ---- ジャイロ静止バイアス（キャリブレーション） ----
 // 接続直後・銃に装着する前の静止状態で記録したGyroX/Y/Zの平均値。
 // ジャイロのゼロ点オフセットにより、静止していても積分値が一定方向に
@@ -744,7 +792,28 @@ function openT0ConfirmModal(estimatedT0, method, viaThreshold, pressTime) {
 
   t0ModalState = { method, viaThreshold, samples, selectedT0: estimatedT0, originalT0: estimatedT0 };
   drawT0ConfirmChart();
+  initT0EvalInputs();
   document.getElementById('t0ConfirmOverlay').classList.add('active');
+}
+
+// T0確認モーダル内の評価入力欄（スコア・低下原因）を初期化する。
+// ショット履歴テーブルと同じCAUSE_OPTIONSを使い、プルダウンを動的生成する。
+function initT0EvalInputs() {
+  const scoreInput = document.getElementById('t0EvalScore');
+  const causeSelect = document.getElementById('t0EvalCause');
+  const freeTextInput = document.getElementById('t0EvalCauseFreeText');
+
+  scoreInput.value = '';
+  freeTextInput.value = '';
+  freeTextInput.style.display = 'none';
+
+  causeSelect.innerHTML = '<option value="">--</option>' +
+    CAUSE_OPTIONS.map(c => `<option value="${c}">${c}</option>`).join('');
+  causeSelect.value = '';
+
+  causeSelect.onchange = () => {
+    freeTextInput.style.display = (causeSelect.value === 'その他（自由入力）') ? 'block' : 'none';
+  };
 }
 
 function closeT0ConfirmModal() {
@@ -863,12 +932,23 @@ document.getElementById('btnT0Confirm').addEventListener('click', () => {
   const { selectedT0, method, originalT0 } = t0ModalState;
   // タップで元の推定位置から動かされた場合は、履歴上で区別できるよう方式を変える
   const finalMethod = (selectedT0 !== originalT0) ? 'manual-adjusted' : method;
+
+  // モーダル内で入力したスコア・低下原因を読み取る（未入力でも可。後からショット履歴で入力・修正できる）
+  const scoreVal = parseFloat(document.getElementById('t0EvalScore').value);
+  const causeVal = document.getElementById('t0EvalCause').value;
+  const causeFreeTextVal = document.getElementById('t0EvalCauseFreeText').value;
+  const evalInput = {
+    mantisScore: isNaN(scoreVal) ? null : scoreVal,
+    cause: causeVal,
+    causeFreeText: causeVal === 'その他（自由入力）' ? causeFreeTextVal : '',
+  };
+
   closeT0ConfirmModal();
-  processShot(selectedT0, finalMethod);
+  processShot(selectedT0, finalMethod, evalInput);
 });
 
 // =========================================================
-// 基準姿勢のキャリブレーション（取り付け角度の回転補正）
+// ジャイロ静止バイアスのキャリブレーション
 // 銃に装着する前、静止させた状態で押すことで、ジャイロのゼロ点オフセット（バイアス）を推定する。
 // 理想的には静止状態でGyroX/Y/Zはすべてゼロになるはずだが、実際にはセンサー固有の
 // ゼロ点ズレが乗っており、これを積分し続けると静止中でも軌跡が一定方向に流れ続ける
@@ -901,7 +981,6 @@ function calibrateOrientation() {
 document.getElementById('btnCalibrate').addEventListener('click', calibrateOrientation);
 
 
-
 // T0の4秒前〜0.5秒後を抽出し、軌跡・暫定D値を計算して履歴に追加する
 // （自作スコア式は未実装。ここではMantisスコアとの突き合わせ用データを残すのみ）
 // 指定した時刻(t0)の直前100msのブレ量D・最大ブレ(peak)を計算する共通関数
@@ -918,11 +997,14 @@ function calcDValue(samples, t0) {
   return { D, peak };
 }
 
-function processShot(t0, method = 'auto') {
+function processShot(t0, method = 'auto', evalInput = null) {
   const windowStart = t0 - PRE_SHOT_MS;
   const windowEnd = t0 + POST_SHOT_MS;
   const windowSamples = liveBuffer.filter(s => s.t >= windowStart && s.t <= windowEnd);
-  if (windowSamples.length < 2) return;
+  if (windowSamples.length < 2) {
+    alert('記録に失敗しました：波形データが不足しています。確認・タップ調整に時間がかかりすぎた可能性があります。もう一度お試しください。');
+    return;
+  }
 
   // 軌跡座標：Gyro X/Yを単純積分して相対角度変化を算出（中心=撃発4秒前の向き）
   const trajectory = buildTrajectory(windowSamples, t0);
@@ -946,9 +1028,11 @@ function processShot(t0, method = 'auto') {
     time: new Date().toLocaleTimeString('ja-JP'),
     method,       // 'auto' | 'manual-peak' | 'manual-fallback'
     methodLabel,
-    mantisScore: null, // 手入力待ち
-    cause: '',         // 手入力待ち（プルダウン選択値）
-    causeFreeText: '', // 「その他」選択時の自由記述
+    // T0確認モーダルで入力済みならその値を初期値とする。未入力ならnull/空文字のまま
+    // （ショット履歴テーブルから後で入力・修正できる従来の動線も維持）。
+    mantisScore: evalInput ? evalInput.mantisScore : null,
+    cause: evalInput ? evalInput.cause : '',
+    causeFreeText: evalInput ? evalInput.causeFreeText : '',
     peak: peak.toFixed(1),
     D: D.toFixed(2),
     waveform: windowSamples,
@@ -962,6 +1046,7 @@ function processShot(t0, method = 'auto') {
   updateLastShotStats(shot);
   updateHud(shot);
   showTrajectory(0); // 最新ショットを自動表示
+  renderProgressPanel(); // モーダルでスコアを入力済みの場合、収集進捗にも即座に反映する
 }
 
 // =========================================================
@@ -1029,12 +1114,8 @@ function quatFromAngularVelocity(gx, gy, gz, dt) {
 // （ロール軸まわりに回転させても、その軸に沿ったベクトル自体の向きは
 // 変わらないため、銃身軸=X軸を基準ベクトルの向きに取る）。
 //
-// 【符号確定】axis_check.htmlによる符号付き実機検証の結果、
-//   上に振る → GyroY負、右に振る → GyroZ正、時計回りロール → GyroX負
-// と確定した。この符号関係で前方ベクトルを回転させると、右に振った際
-// rotated.yは正になるため、pan = atan2(rotated.y, rotated.x)で正しく
-// 「右に振る→panが正（画面右）」に対応する。以前入れていた符号反転
-// （-rotated.y）はこの検証の結果、誤りだったと判明したため解除した。
+// 【符号補正】実機確認により、銃口を右に振ると軌跡が左に動く（逆）ことが
+// 判明したため、pan算出時の符号を反転している。
 function quatToPanTilt(q) {
   // ローカル座標系での「前方向」基準ベクトル(1,0,0)。X軸=銃身軸（ロール軸）。
   const vx = 1, vy = 0, vz = 0;
