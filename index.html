@@ -381,7 +381,7 @@
   <h2>ショット履歴</h2>
   <table>
     <thead>
-      <tr><th>No.</th><th>時刻</th><th>検知</th><th>Mantis<br>スコア</th><th>低下原因<br>(個癖)</th><th>最大ブレ</th><th>軌跡</th></tr>
+      <tr><th>No.</th><th>時刻</th><th>検知</th><th>Mantis<br>スコア</th><th>予測<br>スコア</th><th>誤差</th><th>低下原因<br>(個癖)</th><th>最大ブレ</th><th>軌跡</th></tr>
     </thead>
     <tbody id="shotTable"></tbody>
   </table>
@@ -997,6 +997,38 @@ function calcDValue(samples, t0) {
   return { D, peak };
 }
 
+// =========================================================
+// 点数予測アルゴリズム（検証版）
+//
+// 115件の実測データ（Mantisスコア入力済み）から、全軸・全区間・複数の
+// 時間窓幅を網羅的に検証した結果、撃発直前150msの GyroY(上下)・GyroZ(左右)
+// 合成角速度の平均値が最も予測力が高かった（LOOCV R²=0.370, MAE=10.9点）。
+// 撃発後のサンプルを含めると性能が悪化する（反動・フォロースルーはスコアの
+// 結果であり原因ではないため）ことが確認できたため、撃発前のみを使用する。
+//
+// 回帰式: score = 98.0427 - 5.2918 * pre150_gyzMag_mean
+//
+// 【精度の限界】LOOCV R²=0.370は中程度の説明力に留まり、MAE約11点の
+// 誤差がある。外れ値も複数確認されている（handover.md・分析記録参照）。
+// 実際のMantisスコア入力時に予測値と比較することで、このアルゴリズムの
+// 精度を継続的に検証できるようにしている。
+// =========================================================
+const PREDICT_WINDOW_MS = 150; // 撃発直前の時間窓幅（検証により最適化済み）
+const PREDICT_INTERCEPT = 98.0427;
+const PREDICT_SLOPE = -5.2918;
+
+function calcPredictedScore(samples, t0) {
+  const preWindow = samples.filter(s => s.t >= t0 - PREDICT_WINDOW_MS && s.t < t0);
+  if (preWindow.length < 2) return null;
+  const mags = preWindow.map(s => {
+    const { gy, gz } = applyGyroBias(s.gx, s.gy, s.gz);
+    return Math.sqrt(gy * gy + gz * gz);
+  });
+  const meanMag = mags.reduce((a, b) => a + b, 0) / mags.length;
+  const predicted = PREDICT_INTERCEPT + PREDICT_SLOPE * meanMag;
+  return { predicted, meanMag };
+}
+
 function processShot(t0, method = 'auto', evalInput = null) {
   const windowStart = t0 - PRE_SHOT_MS;
   const windowEnd = t0 + POST_SHOT_MS;
@@ -1021,6 +1053,12 @@ function processShot(t0, method = 'auto', evalInput = null) {
   // 「突き出し」の可能性ヒント（参考情報・断定ではない。詳細は関数コメント参照）
   const thrustHint = checkThrustHint(trajectory);
 
+  // 撃発時の銃口ズレ方向による4分類ヒント（突き出し／銃口上がり／握り込みすぎ／指のかかりが浅い）
+  const quadrantHint = checkQuadrantHint(trajectory);
+
+  // 点数予測アルゴリズム（検証版）。実際のMantisスコア入力後に比較できるよう保持する。
+  const predictedScoreResult = calcPredictedScore(windowSamples, t0);
+
   const methodLabel = { auto: '自動検知', 'manual-peak': '手動(ピーク特定)', 'manual-fallback': '手動(推定T0)', 'manual-adjusted': '手動(タップ修正)' }[method];
 
   const shot = {
@@ -1040,6 +1078,9 @@ function processShot(t0, method = 'auto', evalInput = null) {
     factors,
     reboundHint,
     thrustHint,
+    quadrantHint,
+    predictedScore: predictedScoreResult ? predictedScoreResult.predicted : null,
+    predictMeanMag: predictedScoreResult ? predictedScoreResult.meanMag : null,
   };
   shots.unshift(shot);
   renderShotTable();
@@ -1180,6 +1221,66 @@ function buildTrajectory(samples, t0) {
 }
 
 // =========================================================
+// 撃発時の銃口ズレ方向による低下要因の4分類
+//
+// 撃発直前100ms〜撃発後100msの軌跡（pan=左右, tilt=上下）の変化ベクトル
+// から角度を算出し、以下の4象限のいずれかに該当すればその低下要因候補を
+// 返す。角度はatan2(Δtilt, Δpan)で、右(pan正方向)を0度、反時計回りに
+// 上90度・左180度・下270度(-90度)とする。
+//
+//   上（銃口上がり）    : 90度 ±10度  → 80〜100度
+//   下（突き出し）      : 270度±10度  → 260〜280度
+//   右下（握り込みすぎ）  : 下の境界260度から時計回りに45度 → 215〜260度
+//   左下（引き金を引きながら握り込み）: 下の境界280度から反時計回りに45度 → 280〜325度
+//
+// 【ラベル割り当ての根拠】115件の実測データ（低下原因ラベル×判定象限の
+// クロス集計）により決定した。当初は右下=指のかかりが浅い、左下=握り込み
+// すぎと仮定していたが、実データでは以下の対応が最も一致率が高かった：
+//   muzzle-rise(上)    : 「銃口上がり」ラベルの50%(9/18件)が最頻一致
+//   thrust-out(下)     : 「突き出し」ラベルの48%(10/21件)が最頻一致
+//   shallow-finger(右下): 「握り込みすぎ」ラベルの79%(11/14件)が最頻一致
+//   over-grip(左下)    : 「引き金を引きながら握り込み」ラベルの71%(10/14件)が最頻一致
+// 「指のかかりが浅い」はサンプル数が2件のみで判断材料が不足しており、
+// 「トリガースラップ」もshallow-finger寄り(6/11件)だが握り込みすぎの
+// 一致率の方が高いため、現時点ではshallow-finger=握り込みすぎとし、
+// トリガースラップ・指のかかりが浅いは参考候補として扱う。
+// データが増え次第、この割り当ては再検証が必要。
+//
+// 上記いずれにも該当しない角度（左上・右上領域）は判定不可（null相当）。
+// =========================================================
+const QUADRANT_DEFS = [
+  { key: 'muzzle-rise', label: '銃口上がり', min: 80, max: 100 },
+  { key: 'thrust-out', label: '突き出し', min: 260, max: 280 },
+  { key: 'shallow-finger', label: '握り込みすぎ', min: 215, max: 260 },
+  { key: 'over-grip', label: '引き金を引きながら握り込み', min: 280, max: 325 },
+];
+
+function checkQuadrantHint(trajectory) {
+  const windowPts = trajectory.filter(p => p.t >= -100 && p.t <= 100);
+  if (windowPts.length < 2) return null; // データ不足時は判定しない
+
+  const first = windowPts[0];
+  const last = windowPts[windowPts.length - 1];
+  const dPan = last.x - first.x;
+  const dTilt = last.y - first.y;
+
+  // 変化量が小さすぎる場合は方向が不定なため判定しない
+  const magnitude = Math.sqrt(dPan * dPan + dTilt * dTilt);
+  if (magnitude < 0.05) return { angle: null, magnitude, quadrant: null };
+
+  let angle = Math.atan2(dTilt, dPan) * 180 / Math.PI;
+  if (angle < 0) angle += 360; // 0〜360度に正規化
+
+  const matched = QUADRANT_DEFS.find(q => angle >= q.min && angle < q.max);
+
+  return {
+    angle,
+    magnitude,
+    quadrant: matched ? matched.key : null,
+    quadrantLabel: matched ? matched.label : null,
+  };
+}
+
 // =========================================================
 // 「突き出し」の可能性ヒント（参考情報・断定ではない）
 // 45件・5カテゴリの手動記録データを分析した結果、突き出しのショットは
@@ -1307,6 +1408,25 @@ function renderReboundHintBadge(hint) {
           </div>`;
 }
 
+// 撃発時の銃口ズレ方向(4象限)ヒントの表示バッジ。検証前の仕組みのため、
+// 統計的な精度の裏付けはまだない点を明示する（他の2ヒントとは文言を区別）。
+function renderQuadrantHintBadge(hint) {
+  if (!hint || !hint.quadrant) return '';
+  return `<div style="font-size:9px;color:var(--accent);margin-top:3px;line-height:1.3;"
+            title="撃発直前後の銃口の動く方向から推定（角度=${hint.angle.toFixed(0)}度）。精度は未検証">
+            → ${hint.quadrantLabel}の可能性（方向判定・未検証）
+          </div>`;
+}
+
+// 点数予測アルゴリズムの誤差表示。Mantisスコアが未入力の場合は比較できないため表示しない。
+// 誤差が大きい場合（|誤差|>15点）は色を変え、アルゴリズムの外れ値として目視しやすくする。
+function renderPredictError(shot) {
+  if (shot.mantisScore == null || shot.predictedScore == null) return '--';
+  const err = shot.mantisScore - shot.predictedScore;
+  const color = Math.abs(err) > 15 ? 'var(--bad)' : 'var(--sub)';
+  return `<span style="color:${color};">${err >= 0 ? '+' : ''}${err.toFixed(1)}</span>`;
+}
+
 function renderShotTable() {
   const tbody = document.getElementById('shotTable');
   tbody.innerHTML = shots.map((s, idx) => `
@@ -1317,6 +1437,8 @@ function renderShotTable() {
       <td><input type="number" class="mantis-input" min="0" max="100" step="0.1"
             value="${s.mantisScore ?? ''}" placeholder="--"
             onchange="setMantisScore(${idx}, this.value)"></td>
+      <td style="font-size:12px;color:var(--sub);">${s.predictedScore != null ? s.predictedScore.toFixed(1) : '--'}</td>
+      <td style="font-size:11px;">${renderPredictError(s)}</td>
       <td>
         <select class="cause-select" onchange="setCause(${idx}, this.value)">
           <option value="" ${s.cause === '' ? 'selected' : ''}>--</option>
@@ -1328,6 +1450,7 @@ function renderShotTable() {
         ` : ''}
         ${renderReboundHintBadge(s.reboundHint)}
         ${renderThrustHintBadge(s.thrustHint)}
+        ${renderQuadrantHintBadge(s.quadrantHint)}
       </td>
       <td>${s.peak}</td>
       <td class="action"><button onclick="showTrajectory(${idx})">表示</button></td>
@@ -1557,9 +1680,11 @@ function buildCsv() {
   const calibLine = gyroBiasCalibrated
     ? `# 静止バイアス(dps): GyroX=${gyroBias.gx.toFixed(3)}, GyroY=${gyroBias.gy.toFixed(3)}, GyroZ=${gyroBias.gz.toFixed(3)}\n`
     : '# 静止バイアス: 未記録\n';
-  const header = 'No,時刻,検知方式,Mantisスコア,低下原因,最大ブレdps,ブレ量D,反動予期ヒント,フォロー減衰比,突き出しヒント,直前1秒spreadX,軌跡X,軌跡Y,軌跡t_ms,波形GyroX,波形GyroY,波形GyroZ,波形AccelX,波形AccelY,波形AccelZ\n';
+  const header = 'No,時刻,検知方式,Mantisスコア,予測スコア,予測誤差,低下原因,最大ブレdps,ブレ量D,反動予期ヒント,フォロー減衰比,突き出しヒント,直前1秒spreadX,方向判定カテゴリ,方向判定角度deg,軌跡X,軌跡Y,軌跡t_ms,波形GyroX,波形GyroY,波形GyroZ,波形AccelX,波形AccelY,波形AccelZ\n';
   const rows = shots.map(s => {
     const cause = s.cause === 'その他（自由入力）' ? s.causeFreeText : s.cause;
+    const predScore = s.predictedScore != null ? s.predictedScore.toFixed(1) : '';
+    const predError = (s.mantisScore != null && s.predictedScore != null) ? (s.mantisScore - s.predictedScore).toFixed(1) : '';
     const trajX = s.trajectory.map(p => p.x.toFixed(2)).join(' ');
     const trajY = s.trajectory.map(p => p.y.toFixed(2)).join(' ');
     const trajT = s.trajectory.map(p => p.t).join(' ');
@@ -1573,7 +1698,9 @@ function buildCsv() {
     const decayRatio = s.reboundHint ? s.reboundHint.decayRatio.toFixed(3) : '';
     const thrustFlag = s.thrustHint ? (s.thrustHint.isCandidate ? '該当' : '非該当') : '判定不可';
     const spreadX = s.thrustHint ? s.thrustHint.spreadX.toFixed(3) : '';
-    return `${s.no},${s.time},${s.methodLabel},${s.mantisScore ?? ''},${cause || ''},${s.peak},${s.D},${hintFlag},${decayRatio},${thrustFlag},${spreadX},"${trajX}","${trajY}","${trajT}","${gxArr}","${gyArr}","${gzArr}","${axArr}","${ayArr}","${azArr}"`;
+    const quadrantCategory = s.quadrantHint && s.quadrantHint.quadrant ? s.quadrantHint.quadrant : (s.quadrantHint ? '判定不可(象限外)' : '判定不可(データ不足)');
+    const quadrantAngle = s.quadrantHint && s.quadrantHint.angle != null ? s.quadrantHint.angle.toFixed(1) : '';
+    return `${s.no},${s.time},${s.methodLabel},${s.mantisScore ?? ''},${predScore},${predError},${cause || ''},${s.peak},${s.D},${hintFlag},${decayRatio},${thrustFlag},${spreadX},${quadrantCategory},${quadrantAngle},"${trajX}","${trajY}","${trajT}","${gxArr}","${gyArr}","${gzArr}","${axArr}","${ayArr}","${azArr}"`;
   }).join('\n');
   return calibLine + header + rows;
 }
