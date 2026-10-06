@@ -483,6 +483,8 @@ const CAUSE_OPTIONS = [
   '掌底の押し付けすぎ',
   '銃口上がり',
   'フォロースルー不足',
+  'サミング',
+  '銃口下がり',
   'その他（自由入力）',
 ];
 
@@ -998,34 +1000,91 @@ function calcDValue(samples, t0) {
 }
 
 // =========================================================
-// 点数予測アルゴリズム（検証版）
+// 点数予測アルゴリズム（検証版・時間ビン Ridge 回帰）
 //
-// 115件の実測データ（Mantisスコア入力済み）から、全軸・全区間・複数の
-// 時間窓幅を網羅的に検証した結果、撃発直前150msの GyroY(上下)・GyroZ(左右)
-// 合成角速度の平均値が最も予測力が高かった（LOOCV R²=0.370, MAE=10.9点）。
-// 撃発後のサンプルを含めると性能が悪化する（反動・フォロースルーはスコアの
-// 結果であり原因ではないため）ことが確認できたため、撃発前のみを使用する。
+// 4セッション計248件（Mantisスコア入力済み）で検証した結果、撃発前後の動きを
+// 25msごとの時間ビンに分け、各ビンの角速度の大きさにRidge回帰で重みを学習させる方式を採用した。
+//   特徴量: T0を基準に -400ms〜+100ms を25ms刻み（20ビン）。各ビンで次の2値の平均
+//           ・GyroX(ロール)の絶対値
+//           ・GyroY・GyroZ(上下・左右)の合成角速度
+//           計40特徴量（ビン順に [gx, gyz] を交互に並べる）。サンプルが無いビンは0。
+//   学習: 特徴量を標準化→Ridge(alpha=17.78、内部LOOで選択)→係数を元のスケールに換算して埋め込み。
+//   重みの傾向: GyroY・Z合成の重みが撃発の約150ms前〜25ms前に集中して負（動くほど減点）、
+//               最大は撃発の75〜50ms前。従来の「直前150ms平均」ではこの区間の効きが薄まっていた。
 //
-// 回帰式: score = 98.0427 - 5.2918 * pre150_gyzMag_mean
+// 【窓・ビン幅の選定】窓(-500〜-200 × 0〜+300) × ビン幅(25/50ms)の32通りをセッション別CVで比較し、
+//   最良の (-400, +100, 25ms) を採用。100msビンでは精度が大きく落ちる(時間分解能が必要)。
+//   最良構成の選択手順そのものを別セッションで検証すると MAE 8.55点 / R² 0.751 となり、
+//   採用構成の見かけの値(下記)より約0.7点悪い。期待精度はこちらで見ること。
 //
-// 【精度の限界】LOOCV R²=0.370は中程度の説明力に留まり、MAE約11点の
-// 誤差がある。外れ値も複数確認されている（handover.md・分析記録参照）。
-// 実際のMantisスコア入力時に予測値と比較することで、このアルゴリズムの
-// 精度を継続的に検証できるようにしている。
+// 【精度（セッション別CV＝別日想定、248件、採用構成の見かけの値）】
+//   MAE 7.87点、R² 0.792、±10点以内 71%、±15点以内 89%、AUC(70点以上か)0.957・(90点以上か)0.883。
+//   旧2変数式(MAE 10.2〜10.9点)から改善。
+//   帯別の平均誤差（実測0-30/30-50/50-70/70-90/90+）: -8/-6/-3/+1/+7
+// 【限界】
+//  - 重みは時間分解能が高く、T0が数十msずれると予測が変わる。T0確認モーダルでの確認が重要。
+//  - 低得点帯の過大予測(約-8点)・高得点帯の過小予測(約+7点)は縮んだが残っている。
+//  - 係数40個を248件で推定している。データが増えたら再フィットすること。
+//  - gx側の重みは符号が交互に振れており、個別ビンの解釈はできない（gyz側の傾向のみ解釈可）。
 // =========================================================
-const PREDICT_WINDOW_MS = 150; // 撃発直前の時間窓幅（検証により最適化済み）
-const PREDICT_INTERCEPT = 98.0427;
-const PREDICT_SLOPE = -5.2918;
+const PREDICT_BIN_START_MS = -400; // T0基準
+const PREDICT_BIN_WIDTH_MS = 25;
+const PREDICT_BIN_COUNT = 20;      // -400〜+100ms
+const PREDICT_INTERCEPT = 95.660949;
+const PREDICT_WEIGHTS = [
+   2.552936, -0.499967,  // [-400,-375)ms: gx, gyz
+   1.502107,  1.977680,  // [-375,-350)ms: gx, gyz
+  -0.872751, -1.248889,  // [-350,-325)ms: gx, gyz
+   2.814213,  2.177483,  // [-325,-300)ms: gx, gyz
+   0.556021,  1.002896,  // [-300,-275)ms: gx, gyz
+  -0.132474, -1.071857,  // [-275,-250)ms: gx, gyz
+   1.702201,  2.073260,  // [-250,-225)ms: gx, gyz
+  -0.228780, -0.847703,  // [-225,-200)ms: gx, gyz
+   0.429577, -1.115556,  // [-200,-175)ms: gx, gyz
+  -1.246799, -0.102499,  // [-175,-150)ms: gx, gyz
+   1.495049, -1.752623,  // [-150,-125)ms: gx, gyz
+  -0.083560, -1.380745,  // [-125,-100)ms: gx, gyz
+  -0.692936, -2.050458,  // [-100,-75)ms: gx, gyz
+  -0.716403, -2.382312,  // [-75,-50)ms: gx, gyz
+   0.495277, -1.182388,  // [-50,-25)ms: gx, gyz
+   0.112227, -0.193368,  // [-25,+0)ms: gx, gyz
+   0.045087, -0.327219,  // [+0,+25)ms: gx, gyz
+  -0.051090, -0.098724,  // [+25,+50)ms: gx, gyz
+   0.493428, -1.057241,  // [+50,+75)ms: gx, gyz
+  -0.484592,  0.643541,  // [+75,+100)ms: gx, gyz
+];
 
 function calcPredictedScore(samples, t0) {
-  const preWindow = samples.filter(s => s.t >= t0 - PREDICT_WINDOW_MS && s.t < t0);
-  if (preWindow.length < 2) return null;
-  const mags = preWindow.map(s => {
-    const { gy, gz } = applyGyroBias(s.gx, s.gy, s.gz);
-    return Math.sqrt(gy * gy + gz * gz);
+  const endMs = PREDICT_BIN_START_MS + PREDICT_BIN_WIDTH_MS * PREDICT_BIN_COUNT;
+  const win = samples.filter(s => (s.t - t0) >= PREDICT_BIN_START_MS && (s.t - t0) < endMs);
+  if (win.length < 2) return null;
+  const sumGx = new Array(PREDICT_BIN_COUNT).fill(0);
+  const sumGyz = new Array(PREDICT_BIN_COUNT).fill(0);
+  const cnt = new Array(PREDICT_BIN_COUNT).fill(0);
+  win.forEach(s => {
+    const k = Math.floor(((s.t - t0) - PREDICT_BIN_START_MS) / PREDICT_BIN_WIDTH_MS);
+    if (k < 0 || k >= PREDICT_BIN_COUNT) return;
+    const { gx, gy, gz } = applyGyroBias(s.gx, s.gy, s.gz);
+    sumGx[k] += Math.abs(gx);
+    sumGyz[k] += Math.sqrt(gy * gy + gz * gz);
+    cnt[k] += 1;
   });
-  const meanMag = mags.reduce((a, b) => a + b, 0) / mags.length;
-  const predicted = PREDICT_INTERCEPT + PREDICT_SLOPE * meanMag;
+  let raw = PREDICT_INTERCEPT;
+  for (let k = 0; k < PREDICT_BIN_COUNT; k++) {
+    if (cnt[k] === 0) continue; // サンプルが無いビンは特徴量0（学習時と同じ扱い）
+    raw += PREDICT_WEIGHTS[2 * k] * (sumGx[k] / cnt[k]);
+    raw += PREDICT_WEIGHTS[2 * k + 1] * (sumGyz[k] / cnt[k]);
+  }
+  const predicted = Math.max(0, Math.min(100, raw)); // 0〜100にクリップ
+  // 履歴・CSV互換のため、直前150msのGyroY・Z合成平均も保持する（予測自体には使わない）
+  const pre = samples.filter(s => (s.t - t0) >= -150 && (s.t - t0) < 0);
+  let meanMag = null;
+  if (pre.length >= 1) {
+    meanMag = pre.reduce((acc, s) => {
+      const { gy, gz } = applyGyroBias(s.gx, s.gy, s.gz);
+      return acc + Math.sqrt(gy * gy + gz * gz);
+    }, 0) / pre.length;
+  }
   return { predicted, meanMag };
 }
 
@@ -1221,39 +1280,47 @@ function buildTrajectory(samples, t0) {
 }
 
 // =========================================================
-// 撃発時の銃口ズレ方向による低下要因の4分類
+// 撃発時の銃口ズレ方向による低下要因の6方向分類
 //
 // 撃発直前100ms〜撃発後100msの軌跡（pan=左右, tilt=上下）の変化ベクトル
-// から角度を算出し、以下の4象限のいずれかに該当すればその低下要因候補を
-// 返す。角度はatan2(Δtilt, Δpan)で、右(pan正方向)を0度、反時計回りに
-// 上90度・左180度・下270度(-90度)とする。
+// から角度を算出し、該当方向の低下要因候補を返す。
+// 角度はatan2(Δtilt, Δpan)で、右(pan正方向)=0度、反時計回りに上=90度・左=180度・下=270度。
 //
-//   上（銃口上がり）    : 90度 ±10度  → 80〜100度
-//   下（突き出し）      : 270度±10度  → 260〜280度
-//   右下（握り込みすぎ）  : 下の境界260度から時計回りに45度 → 215〜260度
-//   左下（引き金を引きながら握り込み）: 下の境界280度から反時計回りに45度 → 280〜325度
+// 【方向と低下要因の対応】（ユーザー提示の対応関係に基づく）
+//   上    : 銃口上がり・押し込み
+//   下    : 銃口下がり・突き出し
+//   左    : 指のかかりが浅い・不足
+//   左下  : トリガースラップ・握り込み過ぎ
+//   右    : 指掛け過剰・サミング
+//   右下  : 引き金を引きながら握り込み
 //
-// 【ラベル割り当ての根拠】115件の実測データ（低下原因ラベル×判定象限の
-// クロス集計）により決定した。当初は右下=指のかかりが浅い、左下=握り込み
-// すぎと仮定していたが、実データでは以下の対応が最も一致率が高かった：
-//   muzzle-rise(上)    : 「銃口上がり」ラベルの50%(9/18件)が最頻一致
-//   thrust-out(下)     : 「突き出し」ラベルの48%(10/21件)が最頻一致
-//   shallow-finger(右下): 「握り込みすぎ」ラベルの79%(11/14件)が最頻一致
-//   over-grip(左下)    : 「引き金を引きながら握り込み」ラベルの71%(10/14件)が最頻一致
-// 「指のかかりが浅い」はサンプル数が2件のみで判断材料が不足しており、
-// 「トリガースラップ」もshallow-finger寄り(6/11件)だが握り込みすぎの
-// 一致率の方が高いため、現時点ではshallow-finger=握り込みすぎとし、
-// トリガースラップ・指のかかりが浅いは参考候補として扱う。
-// データが増え次第、この割り当ては再検証が必要。
-//
-// 上記いずれにも該当しない角度（左上・右上領域）は判定不可（null相当）。
+// 【角度境界の根拠】3セッション計188件（2026-10時点）で、低下原因ラベル別の
+// 角度分布（円環平均）から設定した：
+//   指掛け過剰 357° / 銃口上がり 94° / 指のかかりが浅い 205° /
+//   握り込みすぎ 221° / トリガースラップ 239° / 突き出し 278° /
+//   引き金を引きながら握り込み 314°
+// ラベル→方向の一致率（188件中ラベルありの153件）は全体で約70%。
+//   銃口上がり72%・突き出し54%・引き金を引きながら握り込み83%・握り込みすぎ80%・
+//   トリガースラップ63%・指掛け過剰100%(5/5)・指のかかりが浅い56%(5/9)
+// 左下は握り込みすぎ／トリガースラップの角度が重なり、方向のみでは区別できない。
+// 突き出しは下〜右下にまたがる（下に54%、右下に20%）。
+// 低スコア帯でない撃発（スコア85以上）でも上方向に動くケースがあるため、
+// 方向は「低下要因の候補」であり、スコア低下の確定要因ではない。
+// min>maxの区間は0度をまたぐ（右: 335〜25度）。
 // =========================================================
 const QUADRANT_DEFS = [
-  { key: 'muzzle-rise', label: '銃口上がり', min: 80, max: 100 },
-  { key: 'thrust-out', label: '突き出し', min: 260, max: 280 },
-  { key: 'shallow-finger', label: '握り込みすぎ', min: 215, max: 260 },
-  { key: 'over-grip', label: '引き金を引きながら握り込み', min: 280, max: 325 },
+  { key: 'right',      label: '指掛け過剰・サミング',           min: 335, max: 25 },
+  { key: 'up',         label: '銃口上がり・押し込み',           min: 70,  max: 130 },
+  { key: 'left',       label: '指のかかりが浅い',               min: 170, max: 210 },
+  { key: 'lower-left', label: 'トリガースラップ・握り込みすぎ', min: 210, max: 255 },
+  { key: 'down',       label: '突き出し・銃口下がり',           min: 255, max: 290 },
+  { key: 'lower-right',label: '引き金を引きながら握り込み',     min: 290, max: 335 },
 ];
+
+function angleInSector(angle, q) {
+  if (q.min <= q.max) return angle >= q.min && angle < q.max;
+  return angle >= q.min || angle < q.max; // 0度をまたぐ区間
+}
 
 function checkQuadrantHint(trajectory) {
   const windowPts = trajectory.filter(p => p.t >= -100 && p.t <= 100);
@@ -1271,7 +1338,7 @@ function checkQuadrantHint(trajectory) {
   let angle = Math.atan2(dTilt, dPan) * 180 / Math.PI;
   if (angle < 0) angle += 360; // 0〜360度に正規化
 
-  const matched = QUADRANT_DEFS.find(q => angle >= q.min && angle < q.max);
+  const matched = QUADRANT_DEFS.find(q => angleInSector(angle, q));
 
   return {
     angle,
