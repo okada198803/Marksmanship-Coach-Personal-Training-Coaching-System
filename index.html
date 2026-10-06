@@ -1000,61 +1000,70 @@ function calcDValue(samples, t0) {
 }
 
 // =========================================================
-// 点数予測アルゴリズム（検証版・時間ビン Ridge 回帰）
+// 点数予測アルゴリズム（検証版・時間ビン Ridge 回帰＋軌跡特徴）
 //
-// 4セッション計248件（Mantisスコア入力済み）で検証した結果、撃発前後の動きを
-// 25msごとの時間ビンに分け、各ビンの角速度の大きさにRidge回帰で重みを学習させる方式を採用した。
-//   特徴量: T0を基準に -400ms〜+100ms を25ms刻み（20ビン）。各ビンで次の2値の平均
-//           ・GyroX(ロール)の絶対値
-//           ・GyroY・GyroZ(上下・左右)の合成角速度
-//           計40特徴量（ビン順に [gx, gyz] を交互に並べる）。サンプルが無いビンは0。
-//   学習: 特徴量を標準化→Ridge(alpha=17.78、内部LOOで選択)→係数を元のスケールに換算して埋め込み。
-//   重みの傾向: GyroY・Z合成の重みが撃発の約150ms前〜25ms前に集中して負（動くほど減点）、
-//               最大は撃発の75〜50ms前。従来の「直前150ms平均」ではこの区間の効きが薄まっていた。
+// 4セッション計248件（Mantisスコア入力済み）で検証した結果、以下の44特徴量にRidge回帰で
+// 重みを学習させる方式を採用した。
+//   (1) 角速度の時間ビン特徴（40）: T0を基準に -400ms〜+100ms を25ms刻み（20ビン）。
+//       各ビンで次の2値の平均（ビン順に [gx, gyz] を交互に並べる。サンプルが無いビンは0）
+//         ・GyroX(ロール)の絶対値
+//         ・GyroY・GyroZ(上下・左右)の合成角速度
+//   (2) 軌跡特徴（4）: 姿勢追跡で得た軌跡（pan/tilt）から
+//         ・撃発前後100ms(T0-100〜+100)の変位の絶対値 |dx|,|dy|
+//         ・撃発前400ms(T0-400〜0)の広がり（標準偏差）sx,sy
+//   学習: 特徴量を標準化→Ridge(alpha=31.62、内部LOOで選択)→係数を元のスケールに換算して埋め込み。
+//   重みの傾向: GyroY・Z合成の重みが撃発の約150ms前〜25ms前に集中して負（動くほど減点）。
+//               軌跡特徴はすべて負（変位・広がりが大きいほど減点）、特に撃発前の上下方向の広がり(sy)が効く。
 //
-// 【窓・ビン幅の選定】窓(-500〜-200 × 0〜+300) × ビン幅(25/50ms)の32通りをセッション別CVで比較し、
-//   最良の (-400, +100, 25ms) を採用。100msビンでは精度が大きく落ちる(時間分解能が必要)。
-//   最良構成の選択手順そのものを別セッションで検証すると MAE 8.55点 / R² 0.751 となり、
-//   採用構成の見かけの値(下記)より約0.7点悪い。期待精度はこちらで見ること。
+// 【構成の選定】
+//   時間窓: 窓(-500〜-200 × 0〜+300) × ビン幅(25/50ms)の32通りをセッション別CVで比較し (-400,+100,25ms) を採用。
+//           構成選択を含めて別セッション検証すると MAE 8.55点 / R² 0.751（軌跡特徴なし）。
+//   軌跡特徴: 14通りの特徴セットを比較し、セット選択を含む別セッション検証で MAE 7.04点 / R² 0.822。
+//           4セッションすべての検証で同じ系統のセット(変位＋撃発前の広がり)が選ばれ、
+//           セッション別MAEも全セッションで0.7〜1.0点改善した。
+//   ※時間窓の選定による楽観(約0.7点)は残る。期待精度はMAE 7.5〜8点程度と見ること。
 //
 // 【精度（セッション別CV＝別日想定、248件、採用構成の見かけの値）】
-//   MAE 7.87点、R² 0.792、±10点以内 71%、±15点以内 89%、AUC(70点以上か)0.957・(90点以上か)0.883。
-//   旧2変数式(MAE 10.2〜10.9点)から改善。
-//   帯別の平均誤差（実測0-30/30-50/50-70/70-90/90+）: -8/-6/-3/+1/+7
+//   MAE 6.96点、R² 0.827、±10点以内 77%、±15点以内 90%、AUC(70点以上か)0.965・(90点以上か)0.929。
+//   帯別の平均誤差（実測0-30/30-50/50-70/70-90/90+）: -8/-6/-3/+2/+5
 // 【限界】
-//  - 重みは時間分解能が高く、T0が数十msずれると予測が変わる。T0確認モーダルでの確認が重要。
-//  - 低得点帯の過大予測(約-8点)・高得点帯の過小予測(約+7点)は縮んだが残っている。
-//  - 係数40個を248件で推定している。データが増えたら再フィットすること。
-//  - gx側の重みは符号が交互に振れており、個別ビンの解釈はできない（gyz側の傾向のみ解釈可）。
+//  - 重みは時間分解能が高く、T0が10ms動くと約1点、30msで約6点悪化する。T0確認モーダルでの確認が重要。
+//  - 低得点帯の過大予測(約-8点)・高得点帯の過小予測(約+5点)は縮んだが残っている。
+//  - 指のかかりが浅い／指のかけすぎは、撃発前の動きに出にくく過大予測になりやすい（平均-10.5/-7.0点）。
+//  - 係数44個を248件で推定している。データが増えたら再フィットすること。
+//  - gx側の重みは符号が交互に振れており、個別ビンの解釈はできない（gyz側と軌跡特徴の傾向のみ解釈可）。
 // =========================================================
 const PREDICT_BIN_START_MS = -400; // T0基準
 const PREDICT_BIN_WIDTH_MS = 25;
 const PREDICT_BIN_COUNT = 20;      // -400〜+100ms
-const PREDICT_INTERCEPT = 95.660949;
+const PREDICT_INTERCEPT = 93.356060;
 const PREDICT_WEIGHTS = [
-   2.552936, -0.499967,  // [-400,-375)ms: gx, gyz
-   1.502107,  1.977680,  // [-375,-350)ms: gx, gyz
-  -0.872751, -1.248889,  // [-350,-325)ms: gx, gyz
-   2.814213,  2.177483,  // [-325,-300)ms: gx, gyz
-   0.556021,  1.002896,  // [-300,-275)ms: gx, gyz
-  -0.132474, -1.071857,  // [-275,-250)ms: gx, gyz
-   1.702201,  2.073260,  // [-250,-225)ms: gx, gyz
-  -0.228780, -0.847703,  // [-225,-200)ms: gx, gyz
-   0.429577, -1.115556,  // [-200,-175)ms: gx, gyz
-  -1.246799, -0.102499,  // [-175,-150)ms: gx, gyz
-   1.495049, -1.752623,  // [-150,-125)ms: gx, gyz
-  -0.083560, -1.380745,  // [-125,-100)ms: gx, gyz
-  -0.692936, -2.050458,  // [-100,-75)ms: gx, gyz
-  -0.716403, -2.382312,  // [-75,-50)ms: gx, gyz
-   0.495277, -1.182388,  // [-50,-25)ms: gx, gyz
-   0.112227, -0.193368,  // [-25,+0)ms: gx, gyz
-   0.045087, -0.327219,  // [+0,+25)ms: gx, gyz
-  -0.051090, -0.098724,  // [+25,+50)ms: gx, gyz
-   0.493428, -1.057241,  // [+50,+75)ms: gx, gyz
-  -0.484592,  0.643541,  // [+75,+100)ms: gx, gyz
+   1.907892, -0.013520,  // [-400,-375)ms: gx, gyz
+   1.527153,  1.539863,  // [-375,-350)ms: gx, gyz
+  -0.387409, -0.906998,  // [-350,-325)ms: gx, gyz
+   2.525965,  1.933223,  // [-325,-300)ms: gx, gyz
+   0.366335,  0.788138,  // [-300,-275)ms: gx, gyz
+  -0.382590, -1.161198,  // [-275,-250)ms: gx, gyz
+   1.659571,  1.798679,  // [-250,-225)ms: gx, gyz
+   0.113243, -0.438257,  // [-225,-200)ms: gx, gyz
+   0.417247, -0.399349,  // [-200,-175)ms: gx, gyz
+  -0.852842,  0.218822,  // [-175,-150)ms: gx, gyz
+   1.077373, -1.047417,  // [-150,-125)ms: gx, gyz
+  -0.129713, -1.014015,  // [-125,-100)ms: gx, gyz
+  -0.406472, -1.621879,  // [-100,-75)ms: gx, gyz
+  -0.618144, -1.756984,  // [-75,-50)ms: gx, gyz
+   0.293628, -0.665980,  // [-50,-25)ms: gx, gyz
+   0.071254, -0.019592,  // [-25,+0)ms: gx, gyz
+  -0.000757, -0.191532,  // [+0,+25)ms: gx, gyz
+  -0.004594, -0.011548,  // [+25,+50)ms: gx, gyz
+   0.303522, -0.749610,  // [+50,+75)ms: gx, gyz
+  -0.291012,  0.713882,  // [+75,+100)ms: gx, gyz
+  -4.582156, -1.537446,  // 軌跡変位 |dx|, |dy|（T0-100〜+100ms）
+  -29.968051, -44.353241,  // 軌跡の広がり sx, sy（T0-400〜0ms、標準偏差）
 ];
 
-function calcPredictedScore(samples, t0) {
+function calcPredictedScore(samples, t0, trajectory) {
+  if (!trajectory) return null;
   const endMs = PREDICT_BIN_START_MS + PREDICT_BIN_WIDTH_MS * PREDICT_BIN_COUNT;
   const win = samples.filter(s => (s.t - t0) >= PREDICT_BIN_START_MS && (s.t - t0) < endMs);
   if (win.length < 2) return null;
@@ -1069,21 +1078,36 @@ function calcPredictedScore(samples, t0) {
     sumGyz[k] += Math.sqrt(gy * gy + gz * gz);
     cnt[k] += 1;
   });
+  // 軌跡特徴：変位(T0-100〜+100、閉区間)と広がり(T0-400〜0、閉区間・母標準偏差)
+  const around = trajectory.filter(p => p.t >= -100 && p.t <= 100);
+  const pre = trajectory.filter(p => p.t >= -400 && p.t <= 0);
+  if (around.length < 2 || pre.length < 2) return null;
+  const absDx = Math.abs(around[around.length - 1].x - around[0].x);
+  const absDy = Math.abs(around[around.length - 1].y - around[0].y);
+  const popStd = (arr) => {
+    const m = arr.reduce((a, b) => a + b, 0) / arr.length;
+    return Math.sqrt(arr.reduce((a, b) => a + (b - m) ** 2, 0) / arr.length);
+  };
+  const sx = popStd(pre.map(p => p.x));
+  const sy = popStd(pre.map(p => p.y));
+
   let raw = PREDICT_INTERCEPT;
   for (let k = 0; k < PREDICT_BIN_COUNT; k++) {
     if (cnt[k] === 0) continue; // サンプルが無いビンは特徴量0（学習時と同じ扱い）
     raw += PREDICT_WEIGHTS[2 * k] * (sumGx[k] / cnt[k]);
     raw += PREDICT_WEIGHTS[2 * k + 1] * (sumGyz[k] / cnt[k]);
   }
+  raw += PREDICT_WEIGHTS[40] * absDx + PREDICT_WEIGHTS[41] * absDy;
+  raw += PREDICT_WEIGHTS[42] * sx + PREDICT_WEIGHTS[43] * sy;
   const predicted = Math.max(0, Math.min(100, raw)); // 0〜100にクリップ
   // 履歴・CSV互換のため、直前150msのGyroY・Z合成平均も保持する（予測自体には使わない）
-  const pre = samples.filter(s => (s.t - t0) >= -150 && (s.t - t0) < 0);
+  const pre150 = samples.filter(s => (s.t - t0) >= -150 && (s.t - t0) < 0);
   let meanMag = null;
-  if (pre.length >= 1) {
-    meanMag = pre.reduce((acc, s) => {
+  if (pre150.length >= 1) {
+    meanMag = pre150.reduce((acc, s) => {
       const { gy, gz } = applyGyroBias(s.gx, s.gy, s.gz);
       return acc + Math.sqrt(gy * gy + gz * gz);
-    }, 0) / pre.length;
+    }, 0) / pre150.length;
   }
   return { predicted, meanMag };
 }
@@ -1116,7 +1140,7 @@ function processShot(t0, method = 'auto', evalInput = null) {
   const quadrantHint = checkQuadrantHint(trajectory);
 
   // 点数予測アルゴリズム（検証版）。実際のMantisスコア入力後に比較できるよう保持する。
-  const predictedScoreResult = calcPredictedScore(windowSamples, t0);
+  const predictedScoreResult = calcPredictedScore(windowSamples, t0, trajectory);
 
   const methodLabel = { auto: '自動検知', 'manual-peak': '手動(ピーク特定)', 'manual-fallback': '手動(推定T0)', 'manual-adjusted': '手動(タップ修正)' }[method];
 
