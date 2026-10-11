@@ -284,7 +284,7 @@
 </head>
 <body>
 
-<h1><span class="dot" id="connDot"></span>MaCo 射撃解析</h1>
+<h1><span class="dot" id="connDot"></span>MaCo 射撃解析<span id="gunTag" style="font-size:12px;font-weight:600;color:var(--sub);border:1px solid var(--border);border-radius:999px;padding:3px 9px;margin-left:auto;">VP9</span></h1>
 <p style="font-size:11px;color:var(--sub);margin:-8px 0 12px 0;">Marksmanship Coach — Personal Training &amp; Coaching System</p>
 
 <div class="toolbar">
@@ -323,6 +323,12 @@
 
 <div class="panel settings">
   <h2>キャリブレーション設定</h2>
+  <label>銃種（採点モデルと低下要因の程度の区分を切り替える。記録済みのショットは記録時の銃種のまま）:
+    <select id="gunSelect" style="width:100%;margin-top:4px;background:#1a1d22;color:var(--text);border:1px solid var(--border);border-radius:6px;padding:8px;font-size:14px;">
+      <option value="vp9">VP9</option>
+      <option value="glock17">Glock17</option>
+    </select>
+  </label>
   <button id="btnCalibrate" style="width:100%;margin-bottom:12px;background:#1a2a28;border-color:var(--accent);color:var(--accent);">
     📐 静止バイアスを記録（銃に装着する前、置いた状態で押す）
   </button>
@@ -498,7 +504,9 @@ let params = {
   dirThresh: 8,
   manualFallback: 0.4, // 秒。ピークが見つからない場合の固定補正値
   trajScale: 5, // 軌跡表示の倍率設定（枠の半径に対応する角度[deg]。旧FIXED_SCALE_MAX_AMP）
+  gun: 'vp9',   // 銃種（採点モデル・程度の区分を切り替える。錬成アプリと同じGUN_PROFILES）
 };
+try { const g = localStorage.getItem('maco_dev_gun'); if (g === 'vp9' || g === 'glock17') params.gun = g; } catch (e) { /* 保存できない環境では既定値 */ }
 
 let prevAccelMag = null; // 差分計算用に直前サンプルの合成加速度を保持
 
@@ -1062,7 +1070,11 @@ const PREDICT_WEIGHTS = [
     0.196704,              // 撃発瞬間のGyroY・Z合成角速度の最大値（T0-150〜+50ms、上限60dps）
 ];
 
+// 使用中のモデル（錬成アプリでは銃種の設定で切り替える。開発用アプリは常にこの既定値）
+let predictModel = { intercept: PREDICT_INTERCEPT, weights: PREDICT_WEIGHTS };
+
 function calcPredictedScore(samples, t0, trajectory) {
+  const PREDICT_INTERCEPT = predictModel.intercept, PREDICT_WEIGHTS = predictModel.weights;
   if (!trajectory) return null;
   const endMs = PREDICT_BIN_START_MS + PREDICT_BIN_WIDTH_MS * PREDICT_BIN_COUNT;
   const win = samples.filter(s => (s.t - t0) >= PREDICT_BIN_START_MS && (s.t - t0) < endMs);
@@ -1117,6 +1129,53 @@ function calcPredictedScore(samples, t0, trajectory) {
   return { predicted, meanMag };
 }
 
+// =========================================================
+// 銃種プロファイル（2026-10-11 改訂）
+// VP9: 6セッション407発で学習した既定モデル（上のPREDICT_WEIGHTS）。
+// Glock17: VP9 6セッション＋Glock 2セッション(181発)を合わせ、銃種を特徴量に加えて学習したモデルのGlock側の重み。
+//   学習: Huber(δ=5)、L2 alpha=10、Glockの発に4倍の重み（Glock発数が少ないため）。銃種フラグの係数は+3.2点。
+//   VP9モデルのままではGlockで平均約7点低く出る（2セッションとも同傾向: G1 -6.5、G2 -7.2）。
+//   同じ点数でもGlockは撃発前150msの角速度と撃発前の広がりが大きく、VP9モデルではそれを減点しすぎる。
+//   検証（Glockの1セッションを除いて学習→除いたセッションで評価、2通り）:
+//     VP9モデル MAE 9.56・±10点以内67% → このモデル MAE 5.58・±10点以内88%（G1 5.66、G2 5.52）。
+//     Glockの重み倍率とalphaは同じ検証で選んだため、0.3点程度は楽観を含む。
+//   程度の区分: 方向判定の動き量がGlockで約1.3倍（Mantis 0〜90点帯、2セッション合算）のため、境界を1.3倍にする。
+//   旧暫定版（G1のみで学習、区分1.7倍）はG2でMAE 7.70。G1で見えた撃発後の大きな変位はG2では再現しなかった。
+//   VP9にこの混合モデルを使うとVP9の精度が落ちる（LOSO MAE 5.87→6.2前後）ため、VP9は既定モデルのまま。
+// =========================================================
+const GUN_PROFILES = {
+  vp9: { label: 'VP9', intercept: PREDICT_INTERCEPT, weights: PREDICT_WEIGHTS, sevScale: 1 },
+  glock17: { label: 'Glock17', sevScale: 1.3,
+  intercept: 96.793465,
+  weights: [
+     -0.194983,  -0.674929,  // [-400,-375)ms
+     -0.298059,   0.811114,  // [-375,-350)ms
+     -0.950551,   1.112806,  // [-350,-325)ms
+      0.883928,  -0.095682,  // [-325,-300)ms
+      0.593624,   0.739922,  // [-300,-275)ms
+      1.253461,   0.468826,  // [-275,-250)ms
+     -0.308609,   1.918671,  // [-250,-225)ms
+     -0.294617,   0.678407,  // [-225,-200)ms
+      0.221813,  -0.182509,  // [-200,-175)ms
+      0.901001,  -0.268162,  // [-175,-150)ms
+      0.200493,  -1.099059,  // [-150,-125)ms
+      0.606625,  -1.186372,  // [-125,-100)ms
+      1.107184,  -1.085358,  // [-100,-75)ms
+      0.426081,  -1.685803,  // [-75,-50)ms
+      0.469226,  -1.427792,  // [-50,-25)ms
+      0.083778,  -0.237622,  // [-25,+0)ms
+     -0.183863,  -0.130883,  // [+0,+25)ms
+      0.136149,  -0.032511,  // [+25,+50)ms
+      0.133137,  -0.698197,  // [+50,+75)ms
+      0.098447,  -0.327997,  // [+75,+100)ms
+     -2.302876,   1.994501,  // |dx|, |dy|
+    -46.935328, -70.076205,  // sx, sy
+      0.368496,              // 撃発瞬間の最大角速度
+  ],
+  },
+};
+function gunProfile(gun) { return GUN_PROFILES[gun] || GUN_PROFILES.vp9; }
+
 function processShot(t0, method = 'auto', evalInput = null) {
   const windowStart = t0 - PRE_SHOT_MS;
   const windowEnd = t0 + POST_SHOT_MS;
@@ -1144,7 +1203,9 @@ function processShot(t0, method = 'auto', evalInput = null) {
   // 撃発時の銃口ズレ方向による7方向ヒント（低下要因の候補。詳細は関数コメント参照）
   const quadrantHint = checkQuadrantHint(trajectory);
 
-  // 点数予測アルゴリズム。実際のMantisスコア入力後に比較できるよう保持する。
+  // 点数予測アルゴリズム。実際のMantisスコア入力後に比較できるよう保持する。銃種に応じたモデルを使う。
+  const gp = gunProfile(params.gun);
+  predictModel = { intercept: gp.intercept, weights: gp.weights };
   const predictedScoreResult = calcPredictedScore(windowSamples, t0, trajectory);
 
   const methodLabel = { auto: '自動検知', 'manual-peak': '手動(ピーク特定)', 'manual-fallback': '手動(推定T0)', 'manual-adjusted': '手動(タップ修正)' }[method];
@@ -1169,6 +1230,7 @@ function processShot(t0, method = 'auto', evalInput = null) {
     quadrantHint,
     predictedScore: predictedScoreResult ? predictedScoreResult.predicted : null,
     predictMeanMag: predictedScoreResult ? predictedScoreResult.meanMag : null,
+    gun: params.gun,
   };
   shots.unshift(shot);
   renderShotTable();
@@ -1331,13 +1393,17 @@ function buildTrajectory(samples, t0) {
 //
 // 【検証】6セッション計407件（2026-10-09時点、フォロースルー不足1件を除く406件）：
 //   全体一致率 0.766（ラベルあり0.766、「なし」の再現率0.77）。
-//   予測88点以上（「高」帯）で要因を出さない場合は 0.783（「なし」の再現率0.91、ラベルあり0.751）。
 //   再現率: 右0.88 / 右斜め上0.47 / 上0.66 / 左0.73 / 左下0.78 / 下0.82 / 右下0.87
 //   適合率: 右0.72 / 右斜め上0.70 / 上0.82 / 左0.86 / 左下0.85 / 下0.68 / 右下0.88
 //   旧方式（±100ms・閾値0.05・6方向）は全体0.613。
 // 【押し込み（2026-10-09追加検証）】15件の判定先は 上7・なし6・左2。動きのある10件の平均方向は115度で
 //   銃口上がり(87度)と重なり、方向では区別できない。左斜め上の扇形に入るのは1件のみ。
 //   このため上方向のラベルに押し込みを併記し、左斜め上は引き続き未定義とした。
+// 【程度（2026-10-09追加）】変位の大きさで3段階に分け、動き量(deg)と併せて表示する。
+//   軽度 0.3〜0.6 / 中度 0.6〜1.0 / 重度 1.0以上。
+//   方向が出たショットの大きさ中央値は、予測帯 低1.18・中0.85・高0.41。Mantisスコアとの相関は-0.54（大きいほど低得点）。
+//   予測88点以上（「高」帯）でも方向は表示する（帯ごとの差は程度で読む）。ただし高帯で方向が出た23件のうち
+//   Mantisの低下原因と一致したのは22%（52%はMantis側が原因なし）で、高帯の表示は軽い傾向として扱う。
 // 【限界】
 //  - 左下は握り込みすぎ／トリガースラップの角度が重なり、方向のみでは区別できない。
 //  - トリガースラップは下方向にも出る（30件中8件）。
@@ -1348,7 +1414,17 @@ function buildTrajectory(samples, t0) {
 // =========================================================
 const QUADRANT_WINDOW_MS = 200;      // 方向判定に使う窓（T0前後）
 const QUADRANT_MIN_MAGNITUDE = 0.3;  // これ未満の動きは方向を判定しない（deg）
-const QUADRANT_SUPPRESS_SCORE = 88;  // 予測点数がこれ以上なら低下要因を表示しない（「高」帯）
+const QUADRANT_SEVERITY = [         // 程度の区分（変位の大きさ、deg）
+  { max: 0.6, label: '軽度' },
+  { max: 1.0, label: '中度' },
+  { max: Infinity, label: '重度' },
+];
+
+// scale: 銃種による動きの大きさの違いを補正する倍率（区分の境界に掛ける。VP9=1）
+function severityOf(magnitude, scale = 1) {
+  if (magnitude == null || magnitude < QUADRANT_MIN_MAGNITUDE) return null;
+  return QUADRANT_SEVERITY.find(s => magnitude < s.max * scale).label;
+}
 const QUADRANT_DEFS = [
   { key: 'right',       label: '指掛け過剰・サミング',           min: 337.5, max: 22.5 },
   { key: 'up-right',    label: '反動予期',                       min: 22.5,  max: 67.5 },
@@ -1386,6 +1462,7 @@ function checkQuadrantHint(trajectory) {
   return {
     angle,
     magnitude,
+    severity: severityOf(magnitude),
     quadrant: matched ? matched.key : null,
     quadrantLabel: matched ? matched.label : null,
   };
@@ -1518,16 +1595,16 @@ function renderReboundHintBadge(hint) {
           </div>`;
 }
 
-// 撃発時の銃口ズレ方向(7方向)ヒントの表示バッジ。
-// 予測点数が「高」帯(QUADRANT_SUPPRESS_SCORE以上)のショットには表示しない
-// （高得点でも微小な動きで方向が出るため。抑制により「なし」の再現率0.77→0.91）。
-// CSVの方向判定カテゴリには抑制前の判定をそのまま出力する（検証用）。
-function renderQuadrantHintBadge(hint, predictedScore) {
-  if (!hint || !hint.quadrant) return '';
-  if (predictedScore != null && predictedScore >= QUADRANT_SUPPRESS_SCORE) return '';
+// 撃発時の銃口ズレ方向(7方向)ヒントの表示バッジ。程度（軽度/中度/重度）と動き量(deg)を併記する。
+// 予測点数が「高」帯でも方向が出れば表示する（帯ごとの違いは程度で読む）。
+function renderQuadrantHintBadge(hint, gun) {
+  if (!hint || hint.angle == null) return '';
+  const label = hint.quadrant ? hint.quadrantLabel : '左斜め上方向（押し込み等・未検証）';
+  const gp = gunProfile(gun);
+  const sev = `${severityOf(hint.magnitude, gp.sevScale)}（${hint.magnitude.toFixed(2)}°）`;
   return `<div style="font-size:9px;color:var(--accent);margin-top:3px;line-height:1.3;"
-            title="撃発前後200msの銃口の動く方向から推定（角度=${hint.angle.toFixed(0)}度、動き=${hint.magnitude.toFixed(2)}度）。一致率は約77%（参考情報）">
-            → ${hint.quadrantLabel}の可能性（方向判定）
+            title="撃発前後200msの銃口の動く方向から推定（角度=${hint.angle.toFixed(0)}度）。程度は動きの大きさ：軽度0.3〜${(0.6 * gp.sevScale).toFixed(2)}°／中度〜${(1.0 * gp.sevScale).toFixed(2)}°／重度それ以上（${gp.label}）（参考情報）">
+            → ${label}の可能性｜${sev}
           </div>`;
 }
 
@@ -1546,7 +1623,7 @@ function renderShotTable() {
     <tr class="${scoreClass(s)}">
       <td>${s.no}</td>
       <td>${s.time}</td>
-      <td style="font-size:10px;color:${s.method === 'auto' ? 'var(--good)' : 'var(--warn)'};">${s.methodLabel}</td>
+      <td style="font-size:10px;color:${s.method === 'auto' ? 'var(--good)' : 'var(--warn)'};">${s.methodLabel}<div style="color:var(--sub);">${gunProfile(s.gun).label}</div></td>
       <td><input type="number" class="mantis-input" min="0" max="100" step="0.1"
             value="${s.mantisScore ?? ''}" placeholder="--"
             onchange="setMantisScore(${idx}, this.value)"></td>
@@ -1563,7 +1640,7 @@ function renderShotTable() {
         ` : ''}
         ${renderReboundHintBadge(s.reboundHint)}
         ${renderThrustHintBadge(s.thrustHint)}
-        ${renderQuadrantHintBadge(s.quadrantHint, s.predictedScore)}
+        ${renderQuadrantHintBadge(s.quadrantHint, s.gun)}
       </td>
       <td>${s.peak}</td>
       <td class="action"><button onclick="showTrajectory(${idx})">表示</button></td>
@@ -1770,6 +1847,18 @@ bindSlider('dirThresh', 'dirThreshVal', 'dirThresh', true);
 bindSlider('manualFallback', 'manualFallbackVal', 'manualFallback', false);
 bindSlider('trajScale', 'trajScaleVal', 'trajScale', false);
 
+// 銃種の切り替え（以後に記録するショットに適用。記録済みショットの予測は変えない）
+function renderGun() {
+  document.getElementById('gunSelect').value = params.gun;
+  document.getElementById('gunTag').textContent = gunProfile(params.gun).label;
+}
+document.getElementById('gunSelect').addEventListener('change', (e) => {
+  params.gun = e.target.value;
+  try { localStorage.setItem('maco_dev_gun', params.gun); } catch (err) { /* 保存できない環境では無視 */ }
+  renderGun();
+});
+renderGun();
+
 // =========================================================
 // HUDモード（スマートグラス表示想定：黒背景・高コントラスト）
 // =========================================================
@@ -1793,7 +1882,7 @@ function buildCsv() {
   const calibLine = gyroBiasCalibrated
     ? `# 静止バイアス(dps): GyroX=${gyroBias.gx.toFixed(3)}, GyroY=${gyroBias.gy.toFixed(3)}, GyroZ=${gyroBias.gz.toFixed(3)}\n`
     : '# 静止バイアス: 未記録\n';
-  const header = 'No,時刻,検知方式,Mantisスコア,予測スコア,予測誤差,低下原因,最大ブレdps,ブレ量D,反動予期ヒント,フォロー減衰比,突き出しヒント,直前1秒spreadX,方向判定カテゴリ,方向判定角度deg,軌跡X,軌跡Y,軌跡t_ms,波形GyroX,波形GyroY,波形GyroZ,波形AccelX,波形AccelY,波形AccelZ\n';
+  const header = 'No,時刻,検知方式,Mantisスコア,予測スコア,予測誤差,低下原因,最大ブレdps,ブレ量D,反動予期ヒント,フォロー減衰比,突き出しヒント,直前1秒spreadX,方向判定カテゴリ,方向判定角度deg,軌跡X,軌跡Y,軌跡t_ms,波形GyroX,波形GyroY,波形GyroZ,波形AccelX,波形AccelY,波形AccelZ,銃種\n';
   const rows = shots.map(s => {
     const cause = s.cause === 'その他（自由入力）' ? s.causeFreeText : s.cause;
     const predScore = s.predictedScore != null ? s.predictedScore.toFixed(1) : '';
@@ -1813,7 +1902,7 @@ function buildCsv() {
     const spreadX = s.thrustHint ? s.thrustHint.spreadX.toFixed(3) : '';
     const quadrantCategory = s.quadrantHint && s.quadrantHint.quadrant ? s.quadrantHint.quadrant : (s.quadrantHint ? '判定不可(象限外)' : '判定不可(データ不足)');
     const quadrantAngle = s.quadrantHint && s.quadrantHint.angle != null ? s.quadrantHint.angle.toFixed(1) : '';
-    return `${s.no},${s.time},${s.methodLabel},${s.mantisScore ?? ''},${predScore},${predError},${cause || ''},${s.peak},${s.D},${hintFlag},${decayRatio},${thrustFlag},${spreadX},${quadrantCategory},${quadrantAngle},"${trajX}","${trajY}","${trajT}","${gxArr}","${gyArr}","${gzArr}","${axArr}","${ayArr}","${azArr}"`;
+    return `${s.no},${s.time},${s.methodLabel},${s.mantisScore ?? ''},${predScore},${predError},${cause || ''},${s.peak},${s.D},${hintFlag},${decayRatio},${thrustFlag},${spreadX},${quadrantCategory},${quadrantAngle},"${trajX}","${trajY}","${trajT}","${gxArr}","${gyArr}","${gzArr}","${axArr}","${ayArr}","${azArr}",${gunProfile(s.gun).label}`;
   }).join('\n');
   return calibLine + header + rows;
 }
