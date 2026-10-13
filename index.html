@@ -327,6 +327,7 @@
     <select id="gunSelect" style="width:100%;margin-top:4px;background:#1a1d22;color:var(--text);border:1px solid var(--border);border-radius:6px;padding:8px;font-size:14px;">
       <option value="vp9">VP9</option>
       <option value="glock17">Glock17</option>
+      <option value="glock17_gbb">Glock17 ガスブローバック</option>
     </select>
   </label>
   <button id="btnCalibrate" style="width:100%;margin-bottom:12px;background:#1a2a28;border-color:var(--accent);color:var(--accent);">
@@ -506,7 +507,7 @@ let params = {
   trajScale: 5, // 軌跡表示の倍率設定（枠の半径に対応する角度[deg]。旧FIXED_SCALE_MAX_AMP）
   gun: 'vp9',   // 銃種（採点モデル・程度の区分を切り替える。錬成アプリと同じGUN_PROFILES）
 };
-try { const g = localStorage.getItem('maco_dev_gun'); if (g === 'vp9' || g === 'glock17') params.gun = g; } catch (e) { /* 保存できない環境では既定値 */ }
+try { const g = localStorage.getItem('maco_dev_gun'); if (g === 'vp9' || g === 'glock17' || g === 'glock17_gbb') params.gun = g; } catch (e) { /* 保存できない環境では既定値 */ }
 
 let prevAccelMag = null; // 差分計算用に直前サンプルの合成加速度を保持
 
@@ -966,6 +967,8 @@ document.getElementById('btnT0Confirm').addEventListener('click', () => {
 // （buildTrajectory・calcDValue・buildFactorBreakdown・各種ヒント判定）で差し引く。
 // =========================================================
 const CALIB_SAMPLE_COUNT = 100; // 直近何サンプルを平均するか（100Hz想定で約1秒、ノイズ低減のため）
+const CALIB_MAX_SD_DPS = 1.0;   // 静止とみなすばらつき（各軸の標準偏差）の上限
+const CALIB_MAX_BIAS_DPS = 3.0; // バイアスの大きさの上限（これまでの記録は0.3dps以下）
 
 function calibrateOrientation() {
   if (liveBuffer.length < CALIB_SAMPLE_COUNT) {
@@ -980,6 +983,14 @@ function calibrateOrientation() {
   const gx = avg.gx / recent.length;
   const gy = avg.gy / recent.length;
   const gz = avg.gz / recent.length;
+  // 静止の確認：持った状態や机が揺れた状態で記録すると、バイアスが数dpsずれ、撃発4秒前からの軌跡が数十度流れる
+  // （2026-10-12 GBB検証の序盤11発で発生。正しいバイアスでは約1°）。ばらつき・大きさが通常の範囲外なら記録しない。
+  const sd = (k, m) => Math.sqrt(recent.reduce((a, s) => a + (s[k] - m) ** 2, 0) / recent.length);
+  const maxSd = Math.max(sd('gx', gx), sd('gy', gy), sd('gz', gz));
+  if (maxSd > CALIB_MAX_SD_DPS || Math.max(Math.abs(gx), Math.abs(gy), Math.abs(gz)) > CALIB_MAX_BIAS_DPS) {
+    alert(`静止していない可能性があるため記録しませんでした（ばらつき ${maxSd.toFixed(2)} dps／平均 X ${gx.toFixed(2)}・Y ${gy.toFixed(2)}・Z ${gz.toFixed(2)} dps）。\n机などに置いて動かさない状態で、もう一度押してください。`);
+    return;
+  }
 
   gyroBias = { gx, gy, gz };
   gyroBiasCalibrated = true;
@@ -1071,10 +1082,16 @@ const PREDICT_WEIGHTS = [
 ];
 
 // 使用中のモデル（錬成アプリでは銃種の設定で切り替える。開発用アプリは常にこの既定値）
-let predictModel = { intercept: PREDICT_INTERCEPT, weights: PREDICT_WEIGHTS };
+// binCount: 時間ビンの数（-400msから25ms刻み）、dispTo: 変位の窓の終端(ms)、peakTo: 最大角速度の窓の終端(ms、この値未満)。
+// 既定は撃発後を含む構成(-400〜+100ms)。ガスブローバック用は撃発前のみ(binCount 16、dispTo 0、peakTo 0)。
+let predictModel = { intercept: PREDICT_INTERCEPT, weights: PREDICT_WEIGHTS, binCount: PREDICT_BIN_COUNT, dispTo: 100, peakTo: PREDICT_PEAK_TO_MS };
 
 function calcPredictedScore(samples, t0, trajectory) {
   const PREDICT_INTERCEPT = predictModel.intercept, PREDICT_WEIGHTS = predictModel.weights;
+  const PREDICT_BIN_COUNT = predictModel.binCount || 20;
+  const DISP_TO = predictModel.dispTo != null ? predictModel.dispTo : 100;
+  const PEAK_TO = predictModel.peakTo != null ? predictModel.peakTo : PREDICT_PEAK_TO_MS;
+  const NB = 2 * PREDICT_BIN_COUNT; // 軌跡・最大角速度の重みの開始位置
   if (!trajectory) return null;
   const endMs = PREDICT_BIN_START_MS + PREDICT_BIN_WIDTH_MS * PREDICT_BIN_COUNT;
   const win = samples.filter(s => (s.t - t0) >= PREDICT_BIN_START_MS && (s.t - t0) < endMs);
@@ -1092,10 +1109,10 @@ function calcPredictedScore(samples, t0, trajectory) {
     sumGx[k] += Math.abs(gx);
     sumGyz[k] += gyz;
     cnt[k] += 1;
-    if (rel >= PREDICT_PEAK_FROM_MS && rel < PREDICT_PEAK_TO_MS && gyz > peakGyz) peakGyz = gyz;
+    if (rel >= PREDICT_PEAK_FROM_MS && rel < PEAK_TO && gyz > peakGyz) peakGyz = gyz;
   });
   // 軌跡特徴：変位(T0-100〜+100、閉区間)と広がり(T0-400〜0、閉区間・母標準偏差)
-  const around = trajectory.filter(p => p.t >= -100 && p.t <= 100);
+  const around = trajectory.filter(p => p.t >= -100 && p.t <= DISP_TO);
   const pre = trajectory.filter(p => p.t >= -400 && p.t <= 0);
   if (around.length < 2 || pre.length < 2) return null;
   const absDx = Math.abs(around[around.length - 1].x - around[0].x);
@@ -1113,10 +1130,14 @@ function calcPredictedScore(samples, t0, trajectory) {
     raw += PREDICT_WEIGHTS[2 * k] * (sumGx[k] / cnt[k]);
     raw += PREDICT_WEIGHTS[2 * k + 1] * (sumGyz[k] / cnt[k]);
   }
-  raw += PREDICT_WEIGHTS[40] * absDx + PREDICT_WEIGHTS[41] * absDy;
-  raw += PREDICT_WEIGHTS[42] * sx + PREDICT_WEIGHTS[43] * sy;
-  raw += PREDICT_WEIGHTS[44] * Math.min(peakGyz, PREDICT_PEAK_CAP);
-  const predicted = Math.max(0, Math.min(100, raw)); // 0〜100にクリップ
+  raw += PREDICT_WEIGHTS[NB] * absDx + PREDICT_WEIGHTS[NB + 1] * absDy;
+  raw += PREDICT_WEIGHTS[NB + 2] * sx + PREDICT_WEIGHTS[NB + 3] * sy;
+  raw += PREDICT_WEIGHTS[NB + 4] * Math.min(peakGyz, PREDICT_PEAK_CAP);
+  let predicted = Math.max(0, Math.min(100, raw)); // 0〜100にクリップ
+  // 折れ線補正（ガスブローバックのみ）：折れ点(knee)未満は、折れ点からの差を slope 倍に広げる。
+  // GBBは撃発前の動きが同じでもMantisの点数がドライより低く出るため（低得点側で+17〜23点の過大予測）。
+  const cal = predictModel.calib;
+  if (cal && predicted < cal.knee) predicted = Math.max(0, cal.knee - cal.slope * (cal.knee - predicted));
   // 履歴・CSV互換のため、直前150msのGyroY・Z合成平均も保持する（予測自体には使わない）
   const pre150 = samples.filter(s => (s.t - t0) >= -150 && (s.t - t0) < 0);
   let meanMag = null;
@@ -1144,8 +1165,8 @@ function calcPredictedScore(samples, t0, trajectory) {
 //   VP9にこの混合モデルを使うとVP9の精度が落ちる（LOSO MAE 5.87→6.2前後）ため、VP9は既定モデルのまま。
 // =========================================================
 const GUN_PROFILES = {
-  vp9: { label: 'VP9', intercept: PREDICT_INTERCEPT, weights: PREDICT_WEIGHTS, sevScale: 1 },
-  glock17: { label: 'Glock17', sevScale: 1.3,
+  vp9: { label: 'VP9', mode: 'dry', intercept: PREDICT_INTERCEPT, weights: PREDICT_WEIGHTS, sev: [0.6, 1.0] },
+  glock17: { label: 'Glock17', mode: 'dry', sev: [0.78, 1.3],
   intercept: 96.793465,
   weights: [
      -0.194983,  -0.674929,  // [-400,-375)ms
@@ -1173,10 +1194,86 @@ const GUN_PROFILES = {
       0.368496,              // 撃発瞬間の最大角速度
   ],
   },
+  // ガスブローバック（2026-10-12、Glock17 GBB 1セッション30発で検証）
+  glock17_gbb: { label: 'Glock17 GBB', mode: 'gbb', sev: [0.40, 0.77],
+    quad: { from: -200, to: 0, min: 0.08 }, binCount: 16, dispTo: 0, peakTo: 0,
+    // 折れ線補正（2026-10-13、GBB 2セッション99発で推定）。96点以上はそのまま、96点未満は96点からの差を1.45倍。
+    // GBB2(70発、1.6〜98.5点)の5分割CV: 補正なし MAE 10.6 → 7.7。高得点のGBB1(30発)は 2.1 → 2.8。
+    calib: { knee: 96, slope: 1.45 },
+    intercept: 95.834022,
+    weights: [
+      0.334654,  -0.623202,  // [-400,-375)ms
+     -0.531492,   0.983550,  // [-375,-350)ms
+     -1.310776,   1.496992,  // [-350,-325)ms
+      0.587678,  -0.292944,  // [-325,-300)ms
+      0.621347,   1.045642,  // [-300,-275)ms
+      1.150646,   0.364722,  // [-275,-250)ms
+     -0.069881,   1.595226,  // [-250,-225)ms
+     -0.549470,   0.670020,  // [-225,-200)ms
+      0.398294,  -0.289944,  // [-200,-175)ms
+      0.857693,  -0.325719,  // [-175,-150)ms
+      0.258591,  -1.048146,  // [-150,-125)ms
+      0.478333,  -1.116332,  // [-125,-100)ms
+      1.194463,  -1.080882,  // [-100,-75)ms
+      0.474675,  -1.521400,  // [-75,-50)ms
+      0.297297,  -1.269815,  // [-50,-25)ms
+      0.074763,  -0.445003,  // [-25,+0)ms
+     -7.733229,  -1.342001,  // |dx|, |dy|（T0-100〜0ms）
+    -43.888213, -72.709551,  // sx, sy（T0-400〜0ms）
+      0.428704,              // 撃発前の最大角速度（T0-150〜0ms未満）
+    ],
+  },
 };
 function gunProfile(gun) { return GUN_PROFILES[gun] || GUN_PROFILES.vp9; }
+// 採点モデルを銃種に切り替え、プロファイルを返す
+function applyGunProfile(gun) {
+  const gp = gunProfile(gun);
+  predictModel = { intercept: gp.intercept, weights: gp.weights, binCount: gp.binCount || 20, dispTo: gp.dispTo != null ? gp.dispTo : 100, peakTo: gp.peakTo != null ? gp.peakTo : 50, calib: gp.calib || null };
+  return gp;
+}
+// 方向判定の条件（窓・最小の動き）
+function quadOptsOf(gun) { return gunProfile(gun).quad || null; }
+
+// =========================================================
+// ガスブローバックの撃発時刻（T0）
+// GBBは撃発直後にスライドが後退し、上下の角速度が1サンプル(10ms)で約200dpsに跳ね上がる。
+// 加速度差分のピークはこの立ち上がりと同時か0〜60ms遅れるため、ピークをT0にすると撃発前の窓に反動が入る。
+// そこで、ピーク(tp)の前150ms〜後60msで合成角速度が30dpsを超えた最初のサンプルを「反動の立ち上がり」とし、
+// その直前のサンプルをT0とする（反動が入る直前＝撃発の瞬間に相当）。
+// 検証(30発): 立ち上がりはピークの0〜60ms前。T0をピーク・立ち上がり・立ち上がり-10/-20/-30msで比較し、
+//   立ち上がり-10ms（=直前サンプル）が最良（予測の平均誤差 2.1点、ピークのままでは54.7点）。
+// =========================================================
+const GBB_ONSET_DPS = 30;    // 反動の立ち上がりとみなす合成角速度
+const GBB_RECOIL_DPS = 100;  // 反動とみなす合成角速度（T0後100ms以内の最大）。GBB 30発の最小は205、乾燥撃発で満たすのは0.2%
+function gbbT0(samples, tp) {
+  let prev = null;
+  for (const s of samples) {
+    const rel = s.t - tp;
+    if (rel < -150) { prev = s; continue; }
+    if (rel > 60) break;
+    let gm = s.gm;
+    if (gm == null) { const b = applyGyroBias(s.gx, s.gy, s.gz); gm = Math.sqrt(b.gx * b.gx + b.gy * b.gy + b.gz * b.gz); }
+    if (gm > GBB_ONSET_DPS) return prev ? prev.t : null;
+    prev = s;
+  }
+  return null;
+}
 
 function processShot(t0, method = 'auto', evalInput = null) {
+  // ガスブローバック: 選んだ位置（加速度ピーク）の前後から反動の立ち上がりを探し、その直前をT0にする（gbbT0参照）
+  let gbbAdjusted = false, gbbNoRecoil = false;
+  if (gunProfile(params.gun).mode === 'gbb') {
+    const adj = gbbT0(liveBuffer.filter(s => s.t >= t0 - 400 && s.t <= t0 + 60), t0);
+    if (adj != null) { gbbAdjusted = adj !== t0; t0 = adj; }
+    // 反動（T0後100ms以内に100dps以上）が無い位置は、撃発ではない小さなピークを選んでいる可能性が高い
+    // （2026-10-13 GBB検証のNo.13：本当の撃発の約1.4秒後のピークで記録されていた）
+    let recoil = 0;
+    liveBuffer.forEach(s => { if (s.t > t0 && s.t <= t0 + 100) { const b = applyGyroBias(s.gx, s.gy, s.gz); recoil = Math.max(recoil, Math.sqrt(b.gx * b.gx + b.gy * b.gy + b.gz * b.gz)); } });
+    if (adj == null || recoil < GBB_RECOIL_DPS) {
+      gbbNoRecoil = true;
+      alert(`選んだ位置の直後に反動が見つかりません（最大 ${recoil.toFixed(0)} dps）。撃発以外のピークを選んでいる可能性があります。記録は残しますが「反動なし」と表示します。`);
+    }
+  }
   const windowStart = t0 - PRE_SHOT_MS;
   const windowEnd = t0 + POST_SHOT_MS;
   const windowSamples = liveBuffer.filter(s => s.t >= windowStart && s.t <= windowEnd);
@@ -1201,14 +1298,13 @@ function processShot(t0, method = 'auto', evalInput = null) {
   const thrustHint = checkThrustHint(trajectory);
 
   // 撃発時の銃口ズレ方向による7方向ヒント（低下要因の候補。詳細は関数コメント参照）
-  const quadrantHint = checkQuadrantHint(trajectory);
+  const quadrantHint = checkQuadrantHint(trajectory, quadOptsOf(params.gun));
 
   // 点数予測アルゴリズム。実際のMantisスコア入力後に比較できるよう保持する。銃種に応じたモデルを使う。
-  const gp = gunProfile(params.gun);
-  predictModel = { intercept: gp.intercept, weights: gp.weights };
+  applyGunProfile(params.gun);
   const predictedScoreResult = calcPredictedScore(windowSamples, t0, trajectory);
 
-  const methodLabel = { auto: '自動検知', 'manual-peak': '手動(ピーク特定)', 'manual-fallback': '手動(推定T0)', 'manual-adjusted': '手動(タップ修正)' }[method];
+  const methodLabel = { auto: '自動検知', 'manual-peak': '手動(ピーク特定)', 'manual-fallback': '手動(推定T0)', 'manual-adjusted': '手動(タップ修正)' }[method] + (gbbAdjusted ? '+反動補正' : '') + (gbbNoRecoil ? '（反動なし・位置要確認）' : '');
 
   const shot = {
     no: shots.length + 1,
@@ -1420,10 +1516,13 @@ const QUADRANT_SEVERITY = [         // 程度の区分（変位の大きさ、de
   { max: Infinity, label: '重度' },
 ];
 
-// scale: 銃種による動きの大きさの違いを補正する倍率（区分の境界に掛ける。VP9=1）
-function severityOf(magnitude, scale = 1) {
-  if (magnitude == null || magnitude < QUADRANT_MIN_MAGNITUDE) return null;
-  return QUADRANT_SEVERITY.find(s => magnitude < s.max * scale).label;
+// bounds: [軽度の上限, 中度の上限]（deg）。銃種ごとに異なる（VP9 [0.6,1.0]、Glock17 [0.78,1.3]、ガスブローバック [0.40,0.77]）
+// minMag: 方向を判定する最小の動き（VP9・Glock17 0.3、ガスブローバック 0.08）
+function severityOf(magnitude, bounds = [0.6, 1.0], minMag = QUADRANT_MIN_MAGNITUDE) {
+  if (magnitude == null || magnitude < minMag) return null;
+  if (magnitude < bounds[0]) return QUADRANT_SEVERITY[0].label;
+  if (magnitude < bounds[1]) return QUADRANT_SEVERITY[1].label;
+  return QUADRANT_SEVERITY[2].label;
 }
 const QUADRANT_DEFS = [
   { key: 'right',       label: '指掛け過剰・サミング',           min: 337.5, max: 22.5 },
@@ -1441,8 +1540,11 @@ function angleInSector(angle, q) {
   return angle >= q.min || angle < q.max; // 0度をまたぐ区間
 }
 
-function checkQuadrantHint(trajectory) {
-  const windowPts = trajectory.filter(p => p.t >= -QUADRANT_WINDOW_MS && p.t <= QUADRANT_WINDOW_MS);
+// opts: { from, to, min }（窓の始点・終点(ms)と最小の動き(deg)）。省略時は撃発前後200ms・0.3°。
+// ガスブローバックでは撃発後に反動が入るため、撃発前のみ(-200〜0ms)・0.08°を使う。
+function checkQuadrantHint(trajectory, opts) {
+  const o = Object.assign({ from: -QUADRANT_WINDOW_MS, to: QUADRANT_WINDOW_MS, min: QUADRANT_MIN_MAGNITUDE }, opts || {});
+  const windowPts = trajectory.filter(p => p.t >= o.from && p.t <= o.to);
   if (windowPts.length < 2) return null; // データ不足時は判定しない
 
   const first = windowPts[0];
@@ -1452,7 +1554,7 @@ function checkQuadrantHint(trajectory) {
 
   // 変化量が小さい場合は方向が不定（低下要因なし相当）なため判定しない
   const magnitude = Math.sqrt(dPan * dPan + dTilt * dTilt);
-  if (magnitude < QUADRANT_MIN_MAGNITUDE) return { angle: null, magnitude, quadrant: null };
+  if (magnitude < o.min) return { angle: null, magnitude, quadrant: null };
 
   let angle = Math.atan2(dTilt, dPan) * 180 / Math.PI;
   if (angle < 0) angle += 360; // 0〜360度に正規化
@@ -1601,9 +1703,9 @@ function renderQuadrantHintBadge(hint, gun) {
   if (!hint || hint.angle == null) return '';
   const label = hint.quadrant ? hint.quadrantLabel : '左斜め上方向（押し込み等・未検証）';
   const gp = gunProfile(gun);
-  const sev = `${severityOf(hint.magnitude, gp.sevScale)}（${hint.magnitude.toFixed(2)}°）`;
+  const sev = `${severityOf(hint.magnitude, gp.sev, (gp.quad || {}).min)}（${hint.magnitude.toFixed(2)}°）`;
   return `<div style="font-size:9px;color:var(--accent);margin-top:3px;line-height:1.3;"
-            title="撃発前後200msの銃口の動く方向から推定（角度=${hint.angle.toFixed(0)}度）。程度は動きの大きさ：軽度0.3〜${(0.6 * gp.sevScale).toFixed(2)}°／中度〜${(1.0 * gp.sevScale).toFixed(2)}°／重度それ以上（${gp.label}）（参考情報）">
+            title="撃発前後200msの銃口の動く方向から推定（角度=${hint.angle.toFixed(0)}度）。程度は動きの大きさ：軽度${((gp.quad || {}).min || 0.3)}〜${gp.sev[0]}°／中度〜${gp.sev[1]}°／重度それ以上（${gp.label}）（参考情報）">
             → ${label}の可能性｜${sev}
           </div>`;
 }
