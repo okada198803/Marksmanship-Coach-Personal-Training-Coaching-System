@@ -452,6 +452,66 @@ const CHAR_UUID    = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
 
 // ---- パケット構造：uint32 timestamp_ms + float x6 (28 byte, little-endian) ----
 const PACKET_SIZE = 28;
+// =========================================================
+// 受信データの間引き（2026-10-26 追加：ファーム 400Hz・±16G 対応）
+// 新しいファームは1回の通知に28バイトのサンプルを最大4個入れて400Hzで送る（旧ファームは1個・約100Hz）。
+// 撃発の検知・採点・低下要因は100Hzのデータで作ったため、受信周期を時刻の間隔から求め、
+// 100Hzになるよう連続するサンプルを平均して渡す（400Hz→4個ずつ平均）。旧ファーム（約100Hz）はそのまま渡す。
+// 周期は接続ごとに最初の16サンプルで決める（決まるまでの数サンプルは保留し、決まった時点で順に渡す）。
+// 平均の途中で欠落（間隔が通常の1.5倍超）があれば、それまでの分だけで平均する。
+// =========================================================
+const DECIM_TARGET_MS = 10;
+function decimAvg(list) {
+  if (list.length === 1) return list[0];
+  const o = { t: 0, gx: 0, gy: 0, gz: 0, ax: 0, ay: 0, az: 0 }, n = list.length;
+  list.forEach(s => { o.t += s.t; o.gx += s.gx; o.gy += s.gy; o.gz += s.gz; o.ax += s.ax; o.ay += s.ay; o.az += s.az; });
+  for (const k in o) o[k] /= n; return o;
+}
+class Decimator {
+  constructor() { this.reset(); }
+  reset() { this.factor = null; this.dtMean = null; this.lastT = null; this.dts = []; this.hold = []; this.buf = []; }
+  hz() { return this.dtMean ? Math.round(1000 / this.dtMean) : null; }
+  // 受信1サンプル → 100Hzのサンプルの配列（0個以上）
+  push(s) {
+    if (this.lastT != null && s.t < this.lastT - 1000) this.reset(); // デバイスの再起動等
+    if (this.lastT != null) { const dt = s.t - this.lastT; if (dt >= 0 && dt < 50) this.dts.push(dt); }
+    this.lastT = s.t;
+    if (this.factor == null) {
+      this.hold.push(s);
+      if (this.dts.length < 16) return [];
+      this.dtMean = this.dts.reduce((a, b) => a + b, 0) / this.dts.length;
+      this.factor = Math.max(1, Math.round(DECIM_TARGET_MS / Math.max(this.dtMean, 0.5)));
+      const held = this.hold; this.hold = []; const out = [];
+      held.forEach(x => this.feed(x, out)); return out;
+    }
+    const out = []; this.feed(s, out); return out;
+  }
+  feed(s, out) {
+    if (this.factor === 1) { out.push(s); return; }
+    if (this.buf.length && s.t - this.buf[this.buf.length - 1].t > this.dtMean * 1.5 + 1) { out.push(decimAvg(this.buf)); this.buf = []; }
+    this.buf.push(s);
+    if (this.buf.length >= this.factor) { out.push(decimAvg(this.buf)); this.buf = []; }
+  }
+}
+// 保存済みの高周期データ（[{t,gx,..}]、時刻順）を100Hzに間引く（受信時と同じ平均）
+function decimateList(list, factor) {
+  if (!factor || factor <= 1) return list;
+  const d = new Decimator(); d.factor = factor;
+  const dts = []; for (let i = 1; i < list.length && dts.length < 64; i++) { const dt = list[i].t - list[i - 1].t; if (dt >= 0 && dt < 50) dts.push(dt); }
+  d.dtMean = dts.length ? dts.reduce((a, b) => a + b, 0) / dts.length : DECIM_TARGET_MS / factor;
+  const out = []; list.forEach(s => d.feed(s, out)); if (d.buf.length) out.push(decimAvg(d.buf)); return out;
+}
+// BLEの通知（28バイト×n個）をサンプルの配列にする
+function parsePackets(dv) {
+  const out = [];
+  for (let o = 0; o + 28 <= dv.byteLength; o += 28)
+    out.push({ t: dv.getUint32(o, true), gx: dv.getFloat32(o + 4, true), gy: dv.getFloat32(o + 8, true), gz: dv.getFloat32(o + 12, true),
+               ax: dv.getFloat32(o + 16, true), ay: dv.getFloat32(o + 20, true), az: dv.getFloat32(o + 24, true) });
+  return out;
+}
+const decim = new Decimator();
+// 受信周期のまま（400Hz）の直近データ。CSVの「高速波形」列に出す（100Hzの旧ファームでは使わない）
+let hiBuffer = [];
 
 // ---- 状態 ----
 let device = null, gattChar = null;
@@ -606,6 +666,7 @@ function onDisconnected() {
 function setConnected(connected) {
   document.getElementById('connDot').classList.toggle('connected', connected);
   document.getElementById('btnConnect').textContent = connected ? '接続中' : 'BLE接続';
+  if (connected) { decim.reset(); hiBuffer = []; rateShown = false; }
   document.getElementById('btnHud').disabled = !connected;
   document.getElementById('btnManualMark').disabled = !connected;
 }
@@ -613,18 +674,23 @@ function setConnected(connected) {
 // =========================================================
 // IMUデータ受信・パース
 // =========================================================
+// 1回の通知に28バイトのサンプルが1〜4個入る（400Hzファーム）。100Hzに間引いてから従来の処理に渡す（Decimator参照）
 function onImuData(event) {
   const dv = event.target.value; // DataView
   if (dv.byteLength < PACKET_SIZE) return;
-
-  const t = dv.getUint32(0, true);
-  const gx = dv.getFloat32(4, true);
-  const gy = dv.getFloat32(8, true);
-  const gz = dv.getFloat32(12, true);
-  const ax = dv.getFloat32(16, true);
-  const ay = dv.getFloat32(20, true);
-  const az = dv.getFloat32(24, true);
-
+  parsePackets(dv).forEach(raw => {
+    if (decim.factor > 1 || (decim.factor == null && decim.hold.length)) {
+      hiBuffer.push(raw);
+      const cut = raw.t - LIVE_BUFFER_MAX_MS; while (hiBuffer.length && hiBuffer[0].t < cut) hiBuffer.shift();
+    }
+    decim.push(raw).forEach(onSample100);
+  });
+  if (decim.factor === 1 && hiBuffer.length) hiBuffer = [];
+  const hz = decim.hz(); if (hz && !rateShown) { rateShown = true; document.getElementById('btnConnect').textContent = `接続中 ${hz}Hz`; }
+}
+let rateShown = false;
+function onSample100(raw) {
+  const { t, gx, gy, gz, ax, ay, az } = raw;
   const sample = { t, gx, gy, gz, ax, ay, az, diff: 0 };
   liveBuffer.push(sample);
 
@@ -1327,6 +1393,10 @@ function processShot(t0, method = 'auto', evalInput = null) {
     predictedScore: predictedScoreResult ? predictedScoreResult.predicted : null,
     predictMeanMag: predictedScoreResult ? predictedScoreResult.meanMag : null,
     gun: params.gun,
+    srcHz: decim.hz(),
+    t0Abs: t0,
+    // 400Hzファーム：受信周期のままの波形（撃発前4秒〜後0.5秒）。高周期での撃発時刻・特徴の検討用
+    hiWave: decim.factor > 1 ? hiBuffer.filter(s => s.t >= windowStart && s.t <= windowEnd) : null,
   };
   shots.unshift(shot);
   renderShotTable();
@@ -1978,13 +2048,20 @@ function updateHud(shot) {
 // =========================================================
 // CSVエクスポート / 共有
 // =========================================================
+// 高速波形の列（t_msはT0基準。400Hzファームのみ、旧ファームは空欄）
+function hiCols(s) {
+  const w = s.hiWave; if (!w || !w.length) return ',,,,,,';
+  const t0 = s.t0Abs;
+  const j = (f, d) => '"' + w.map(x => f(x).toFixed(d)).join(' ') + '"';
+  return [j(x => x.t - t0, 1), j(x => x.gx, 2), j(x => x.gy, 2), j(x => x.gz, 2), j(x => x.ax, 3), j(x => x.ay, 3), j(x => x.az, 3)].join(',');
+}
 function buildCsv() {
   // Mantisスコアと自作側の生データ(D値・軌跡)を突き合わせられる形式で出力する。
   // 将来この対応データから自作スコア式の閾値(Dmin/Dmax等)を決定する。
   const calibLine = gyroBiasCalibrated
     ? `# 静止バイアス(dps): GyroX=${gyroBias.gx.toFixed(3)}, GyroY=${gyroBias.gy.toFixed(3)}, GyroZ=${gyroBias.gz.toFixed(3)}\n`
     : '# 静止バイアス: 未記録\n';
-  const header = 'No,時刻,検知方式,Mantisスコア,予測スコア,予測誤差,低下原因,最大ブレdps,ブレ量D,反動予期ヒント,フォロー減衰比,突き出しヒント,直前1秒spreadX,方向判定カテゴリ,方向判定角度deg,軌跡X,軌跡Y,軌跡t_ms,波形GyroX,波形GyroY,波形GyroZ,波形AccelX,波形AccelY,波形AccelZ,銃種\n';
+  const header = 'No,時刻,検知方式,Mantisスコア,予測スコア,予測誤差,低下原因,最大ブレdps,ブレ量D,反動予期ヒント,フォロー減衰比,突き出しヒント,直前1秒spreadX,方向判定カテゴリ,方向判定角度deg,軌跡X,軌跡Y,軌跡t_ms,波形GyroX,波形GyroY,波形GyroZ,波形AccelX,波形AccelY,波形AccelZ,銃種,受信Hz,高速t_ms,高速GyroX,高速GyroY,高速GyroZ,高速AccelX,高速AccelY,高速AccelZ\n';
   const rows = shots.map(s => {
     const cause = s.cause === 'その他（自由入力）' ? s.causeFreeText : s.cause;
     const predScore = s.predictedScore != null ? s.predictedScore.toFixed(1) : '';
@@ -2004,7 +2081,7 @@ function buildCsv() {
     const spreadX = s.thrustHint ? s.thrustHint.spreadX.toFixed(3) : '';
     const quadrantCategory = s.quadrantHint && s.quadrantHint.quadrant ? s.quadrantHint.quadrant : (s.quadrantHint ? '判定不可(象限外)' : '判定不可(データ不足)');
     const quadrantAngle = s.quadrantHint && s.quadrantHint.angle != null ? s.quadrantHint.angle.toFixed(1) : '';
-    return `${s.no},${s.time},${s.methodLabel},${s.mantisScore ?? ''},${predScore},${predError},${cause || ''},${s.peak},${s.D},${hintFlag},${decayRatio},${thrustFlag},${spreadX},${quadrantCategory},${quadrantAngle},"${trajX}","${trajY}","${trajT}","${gxArr}","${gyArr}","${gzArr}","${axArr}","${ayArr}","${azArr}",${gunProfile(s.gun).label}`;
+    return `${s.no},${s.time},${s.methodLabel},${s.mantisScore ?? ''},${predScore},${predError},${cause || ''},${s.peak},${s.D},${hintFlag},${decayRatio},${thrustFlag},${spreadX},${quadrantCategory},${quadrantAngle},"${trajX}","${trajY}","${trajT}","${gxArr}","${gyArr}","${gzArr}","${axArr}","${ayArr}","${azArr}",${gunProfile(s.gun).label},${s.srcHz || ''},${hiCols(s)}`;
   }).join('\n');
   return calibLine + header + rows;
 }
