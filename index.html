@@ -512,6 +512,44 @@ function parsePackets(dv) {
 const decim = new Decimator();
 // 受信周期のまま（400Hz）の直近データ。CSVの「高速波形」列に出す（100Hzの旧ファームでは使わない）
 let hiBuffer = [];
+// 受信の欠落：サンプル間隔が周期の1.5倍を超えたら、その間の欠落数を数える（接続ごとにリセット）
+const rxStat = { lastT: null, recv: 0, lost: 0, shownAt: 0 };
+function countGap(t) {
+  const dtm = decim.dtMean;
+  if (rxStat.lastT != null && dtm) {
+    const dt = t - rxStat.lastT;
+    if (dt > dtm * 1.5 + 1 && dt < 1000) rxStat.lost += Math.max(0, Math.round(dt / dtm) - 1);
+  }
+  rxStat.lastT = t; rxStat.recv++;
+}
+// 区間内の欠落数（高速波形から数える）
+function gapsIn(list) {
+  if (!list || list.length < 2) return null;
+  const n = Math.min(list.length - 1, 64); let sum = 0, c = 0;
+  for (let i = 1; i <= n; i++) { const d = list[i].t - list[i - 1].t; if (d > 0 && d < 50) { sum += d; c++; } }
+  const dtm = c ? sum / c : null; if (!dtm) return null;
+  let lost = 0;
+  for (let i = 1; i < list.length; i++) { const d = list[i].t - list[i - 1].t; if (d > dtm * 1.5 + 1 && d < 1000) lost += Math.max(0, Math.round(d / dtm) - 1); }
+  return lost;
+}
+
+// ---- T0の合わせ直し（比較用・2026-10-27） ----
+// 手動で決めたT0の前後±20msで、受信周期のまま（400Hz）の加速度の合成値の変化が最大の点を探し、
+// その点 +4ms を補正後のT0とする（+4msは実機VP9 49発でのずれの中央値。学習時のT0の位置に合わせるため）。
+// 試算（VP9 49発）：予測の平均絶対誤差 5.98 → 5.51。設定を同じデータで選んだため甘めの値。別のセッションで確認してから採用する。
+// 予測・CSVの「予測スコア(T0補正)」にだけ使い、表示・軌跡・他の指標は従来のT0のまま。
+const T0_REFINE_WIN_MS = 20;
+const T0_REFINE_OFFSET_MS = 4;
+function refineT0(hi, t0) {
+  if (!hi || hi.length < 3) return null;
+  let best = null, bd = -1;
+  const mag = a => Math.sqrt(a.ax * a.ax + a.ay * a.ay + a.az * a.az);
+  for (let i = 1; i < hi.length; i++) {
+    const r = hi[i].t - t0; if (r < -T0_REFINE_WIN_MS || r > T0_REFINE_WIN_MS) continue;
+    const d = Math.abs(mag(hi[i]) - mag(hi[i - 1])); if (d > bd) { bd = d; best = hi[i].t; }
+  }
+  return best == null ? null : best + T0_REFINE_OFFSET_MS;
+}
 
 // ---- 状態 ----
 let device = null, gattChar = null;
@@ -666,7 +704,7 @@ function onDisconnected() {
 function setConnected(connected) {
   document.getElementById('connDot').classList.toggle('connected', connected);
   document.getElementById('btnConnect').textContent = connected ? '接続中' : 'BLE接続';
-  if (connected) { decim.reset(); hiBuffer = []; rateShown = false; }
+  if (connected) { decim.reset(); hiBuffer = []; rateShown = false; rxStat.lastT = null; rxStat.recv = 0; rxStat.lost = 0; rxStat.shownAt = 0; }
   document.getElementById('btnHud').disabled = !connected;
   document.getElementById('btnManualMark').disabled = !connected;
 }
@@ -684,9 +722,16 @@ function onImuData(event) {
       const cut = raw.t - LIVE_BUFFER_MAX_MS; while (hiBuffer.length && hiBuffer[0].t < cut) hiBuffer.shift();
     }
     decim.push(raw).forEach(onSample100);
+    countGap(raw.t);
   });
   if (decim.factor === 1 && hiBuffer.length) hiBuffer = [];
-  const hz = decim.hz(); if (hz && !rateShown) { rateShown = true; document.getElementById('btnConnect').textContent = `接続中 ${hz}Hz`; }
+  // 接続ボタンに受信周期と欠落率を表示（1秒ごと）
+  const hz = decim.hz(), now = Date.now();
+  if (hz && (!rateShown || now - rxStat.shownAt >= 1000)) {
+    rateShown = true; rxStat.shownAt = now;
+    const tot = rxStat.recv + rxStat.lost, pct = tot ? rxStat.lost / tot * 100 : 0;
+    document.getElementById('btnConnect').textContent = `接続中 ${hz}Hz 欠落${rxStat.lost}(${pct.toFixed(1)}%)`;
+  }
 }
 let rateShown = false;
 function onSample100(raw) {
@@ -1369,6 +1414,15 @@ function processShot(t0, method = 'auto', evalInput = null) {
   // 点数予測アルゴリズム。実際のMantisスコア入力後に比較できるよう保持する。銃種に応じたモデルを使う。
   applyGunProfile(params.gun);
   const predictedScoreResult = calcPredictedScore(windowSamples, t0, trajectory);
+  // 比較用：400Hzの波形でT0を合わせ直した場合の予測（CSVのみ）
+  const hiWave = decim.factor > 1 ? hiBuffer.filter(s => s.t >= windowStart && s.t <= windowEnd) : null;
+  let refined = null;
+  const t0r = refineT0(hiWave, t0);
+  if (t0r != null) {
+    const wsR = liveBuffer.filter(s => s.t >= t0r - PRE_SHOT_MS && s.t <= t0r + POST_SHOT_MS);
+    const pr = wsR.length >= 2 ? calcPredictedScore(wsR, t0r, buildTrajectory(wsR, t0r)) : null;
+    refined = { shift: t0r - t0, predicted: pr ? pr.predicted : null };
+  }
 
   const methodLabel = { auto: '自動検知', 'manual-peak': '手動(ピーク特定)', 'manual-fallback': '手動(推定T0)', 'manual-adjusted': '手動(タップ修正)' }[method] + (gbbAdjusted ? '+反動補正' : '') + (gbbNoRecoil ? '（反動なし・位置要確認）' : '');
 
@@ -1396,7 +1450,9 @@ function processShot(t0, method = 'auto', evalInput = null) {
     srcHz: decim.hz(),
     t0Abs: t0,
     // 400Hzファーム：受信周期のままの波形（撃発前4秒〜後0.5秒）。高周期での撃発時刻・特徴の検討用
-    hiWave: decim.factor > 1 ? hiBuffer.filter(s => s.t >= windowStart && s.t <= windowEnd) : null,
+    hiWave,
+    refined,                       // { shift: 補正量ms, predicted: 補正後T0での予測 }（400Hzのみ）
+    lost: gapsIn(hiWave),          // 撃発前4秒〜後0.5秒の欠落サンプル数（400Hzのみ）
   };
   shots.unshift(shot);
   renderShotTable();
@@ -2061,7 +2117,7 @@ function buildCsv() {
   const calibLine = gyroBiasCalibrated
     ? `# 静止バイアス(dps): GyroX=${gyroBias.gx.toFixed(3)}, GyroY=${gyroBias.gy.toFixed(3)}, GyroZ=${gyroBias.gz.toFixed(3)}\n`
     : '# 静止バイアス: 未記録\n';
-  const header = 'No,時刻,検知方式,Mantisスコア,予測スコア,予測誤差,低下原因,最大ブレdps,ブレ量D,反動予期ヒント,フォロー減衰比,突き出しヒント,直前1秒spreadX,方向判定カテゴリ,方向判定角度deg,軌跡X,軌跡Y,軌跡t_ms,波形GyroX,波形GyroY,波形GyroZ,波形AccelX,波形AccelY,波形AccelZ,銃種,受信Hz,高速t_ms,高速GyroX,高速GyroY,高速GyroZ,高速AccelX,高速AccelY,高速AccelZ\n';
+  const header = 'No,時刻,検知方式,Mantisスコア,予測スコア,予測誤差,低下原因,最大ブレdps,ブレ量D,反動予期ヒント,フォロー減衰比,突き出しヒント,直前1秒spreadX,方向判定カテゴリ,方向判定角度deg,軌跡X,軌跡Y,軌跡t_ms,波形GyroX,波形GyroY,波形GyroZ,波形AccelX,波形AccelY,波形AccelZ,銃種,受信Hz,高速t_ms,高速GyroX,高速GyroY,高速GyroZ,高速AccelX,高速AccelY,高速AccelZ,予測スコア(T0補正),T0補正ms,欠落数\n';
   const rows = shots.map(s => {
     const cause = s.cause === 'その他（自由入力）' ? s.causeFreeText : s.cause;
     const predScore = s.predictedScore != null ? s.predictedScore.toFixed(1) : '';
@@ -2081,7 +2137,7 @@ function buildCsv() {
     const spreadX = s.thrustHint ? s.thrustHint.spreadX.toFixed(3) : '';
     const quadrantCategory = s.quadrantHint && s.quadrantHint.quadrant ? s.quadrantHint.quadrant : (s.quadrantHint ? '判定不可(象限外)' : '判定不可(データ不足)');
     const quadrantAngle = s.quadrantHint && s.quadrantHint.angle != null ? s.quadrantHint.angle.toFixed(1) : '';
-    return `${s.no},${s.time},${s.methodLabel},${s.mantisScore ?? ''},${predScore},${predError},${cause || ''},${s.peak},${s.D},${hintFlag},${decayRatio},${thrustFlag},${spreadX},${quadrantCategory},${quadrantAngle},"${trajX}","${trajY}","${trajT}","${gxArr}","${gyArr}","${gzArr}","${axArr}","${ayArr}","${azArr}",${gunProfile(s.gun).label},${s.srcHz || ''},${hiCols(s)}`;
+    return `${s.no},${s.time},${s.methodLabel},${s.mantisScore ?? ''},${predScore},${predError},${cause || ''},${s.peak},${s.D},${hintFlag},${decayRatio},${thrustFlag},${spreadX},${quadrantCategory},${quadrantAngle},"${trajX}","${trajY}","${trajT}","${gxArr}","${gyArr}","${gzArr}","${axArr}","${ayArr}","${azArr}",${gunProfile(s.gun).label},${s.srcHz || ''},${hiCols(s)},${s.refined && s.refined.predicted != null ? s.refined.predicted.toFixed(1) : ''},${s.refined ? s.refined.shift.toFixed(1) : ''},${s.lost ?? ''}`;
   }).join('\n');
   return calibLine + header + rows;
 }
